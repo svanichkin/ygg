@@ -244,6 +244,66 @@ type AppConfig struct {
 	Peers []string `json:"peers"`
 	// DialTimeoutSec controls connect timeouts.
 	DialTimeoutSec int `json:"dial_timeout_sec,omitempty"`
+	raw            map[string]json.RawMessage
+}
+
+func (c *AppConfig) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Seed           string   `json:"seed,omitempty"`
+		Peers          []string `json:"peers"`
+		DialTimeoutSec int      `json:"dial_timeout_sec,omitempty"`
+	}
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	c.Seed = a.Seed
+	c.Peers = a.Peers
+	c.DialTimeoutSec = a.DialTimeoutSec
+	if c.Peers == nil {
+		c.Peers = []string{}
+	}
+	raw := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	c.raw = raw
+	return nil
+}
+
+func (c *AppConfig) MarshalJSON() ([]byte, error) {
+	raw := make(map[string]json.RawMessage, len(c.raw)+3)
+	for k, v := range c.raw {
+		raw[k] = v
+	}
+	if c.Seed != "" {
+		b, err := json.Marshal(c.Seed)
+		if err != nil {
+			return nil, err
+		}
+		raw["seed"] = b
+	} else {
+		delete(raw, "seed")
+	}
+	peers := c.Peers
+	if peers == nil {
+		peers = []string{}
+	}
+	b, err := json.Marshal(peers)
+	if err != nil {
+		return nil, err
+	}
+	raw["peers"] = b
+	if c.DialTimeoutSec != 0 {
+		b, err = json.Marshal(c.DialTimeoutSec)
+		if err != nil {
+			return nil, err
+		}
+		raw["dial_timeout_sec"] = b
+	} else {
+		delete(raw, "dial_timeout_sec")
+	}
+	return json.Marshal(raw)
 }
 
 func LoadOrInitAppConfig(path string) (*AppConfig, error) {
@@ -273,6 +333,7 @@ func LoadOrInitAppConfig(path string) (*AppConfig, error) {
 	c := &AppConfig{
 		Peers:          []string{},
 		DialTimeoutSec: 3,
+		raw:            map[string]json.RawMessage{},
 	}
 	c.Peers = append(c.Peers, "tcp://37.186.113.100:1514",
 		"quic://37.186.113.100:1515",

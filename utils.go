@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -156,11 +157,13 @@ func FilterAlivePeers(peers []string, timeout time.Duration, maxParallel int) []
 		maxParallel = 16
 	}
 	type result struct {
-		idx int
-		ok  bool
+		idx     int
+		ok      bool
+		latency time.Duration
+		peer    string
 	}
 
-	alive := make([]string, 0, len(peers))
+	alive := make([]result, 0, len(peers))
 	ch := make(chan result, len(peers))
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
@@ -176,8 +179,8 @@ func FilterAlivePeers(peers []string, timeout time.Duration, maxParallel int) []
 		go func(idx int, p string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			ok := probePeer(p, timeout)
-			ch <- result{idx: idx, ok: ok}
+			ok, latency := probePeer(p, timeout)
+			ch <- result{idx: idx, ok: ok, latency: latency, peer: p}
 		}(i, raw)
 	}
 
@@ -186,16 +189,27 @@ func FilterAlivePeers(peers []string, timeout time.Duration, maxParallel int) []
 
 	for res := range ch {
 		if res.ok {
-			alive = append(alive, strings.TrimSpace(peers[res.idx]))
+			alive = append(alive, res)
 		}
 	}
-	return alive
+	sort.SliceStable(alive, func(i, j int) bool {
+		if alive[i].latency == alive[j].latency {
+			return alive[i].idx < alive[j].idx
+		}
+		return alive[i].latency < alive[j].latency
+	})
+
+	out := make([]string, len(alive))
+	for i, res := range alive {
+		out[i] = res.peer
+	}
+	return out
 }
 
-func probePeer(raw string, timeout time.Duration) bool {
+func probePeer(raw string, timeout time.Duration) (bool, time.Duration) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return false
+		return false, 0
 	}
 
 	switch strings.ToLower(u.Scheme) {
@@ -210,12 +224,13 @@ func probePeer(raw string, timeout time.Duration) bool {
 		}
 		cl := &http.Client{Transport: tr, Timeout: timeout}
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, raw, nil)
+		start := time.Now()
 		resp, err := cl.Do(req)
 		if err != nil {
-			return false
+			return false, time.Since(start)
 		}
 		resp.Body.Close()
-		return true
+		return true, time.Since(start)
 
 	default:
 		// For other schemes, try TCP to host:port if present.
@@ -225,15 +240,16 @@ func probePeer(raw string, timeout time.Duration) bool {
 			hostport = u.Opaque
 		}
 		if hostport == "" {
-			return false
+			return false, 0
 		}
+		start := time.Now()
 		d := net.Dialer{Timeout: timeout}
 		c, err := d.Dial("tcp", hostport)
 		if err != nil {
-			return false
+			return false, time.Since(start)
 		}
 		_ = c.Close()
-		return true
+		return true, time.Since(start)
 	}
 }
 
