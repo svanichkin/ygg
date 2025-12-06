@@ -14,7 +14,7 @@ Ygg is a lightweight Go library that embeds a self-contained Yggdrasil node — 
 ## Installation
 
 ```bash
-go get github.com/svanichkin/Ygg
+go get github.com/svanichkin/ygg
 ```
 
 ## Usage
@@ -24,7 +24,7 @@ package main
 
 import (
     "log"
-    ygg "github.com/svanichkin/Ygg"
+    ygg "github.com/svanichkin/ygg"
 )
 
 func main() {
@@ -32,9 +32,9 @@ func main() {
 
     ygg.SetConnectivityHandler(func(connected bool) {
         if connected {
-            log.Println("[Ygg] Connected to the network")
+            log.Println("[ygg] Connected to the network")
         } else {
-            log.Println("[Ygg] Disconnected from the network")
+            log.Println("[ygg] Disconnected from the network")
         }
     })
 
