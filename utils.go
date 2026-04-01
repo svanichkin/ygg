@@ -19,12 +19,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	ycore "github.com/yggdrasil-network/yggdrasil-go/src/core"
 )
 
 func SaveJSON(path string, v any) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("empty path")
+	}
 	tmp := path + ".tmp"
-	b, _ := json.MarshalIndent(v, "", "  ")
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
@@ -65,13 +72,14 @@ type publicPeerEntry struct {
 }
 
 var supportedPeerSchemes = map[string]struct{}{
-	"http":  {},
-	"https": {},
-	"tcp":   {},
-	"tls":   {},
-	"quic":  {},
-	"ws":    {},
-	"wss":   {},
+	"tcp":      {},
+	"tls":      {},
+	"socks":    {},
+	"sockstls": {},
+	"unix":     {},
+	"quic":     {},
+	"ws":       {},
+	"wss":      {},
 }
 
 // fetchPeersFromURL downloads the JSON peer list and returns usable endpoints.
@@ -151,7 +159,6 @@ func isSupportedPeerScheme(raw string) bool {
 }
 
 // FilterAlivePeers checks peer availability and returns only those considered "alive".
-// For http/https - perform HTTP GET with InsecureTLS; for other schemes - TCP dial to host:port.
 func FilterAlivePeers(peers []string, timeout time.Duration, maxParallel int) []string {
 	if maxParallel <= 0 {
 		maxParallel = 16
@@ -213,27 +220,53 @@ func probePeer(raw string, timeout time.Duration) (bool, time.Duration) {
 	}
 
 	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-		// Any successful HTTP response (any status) counts as alive.
-		tr := &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // insecure, like curl -k
-			},
-			DialContext: (&net.Dialer{Timeout: timeout}).DialContext,
+	case "quic":
+		host := u.Hostname()
+		port := u.Port()
+		if host == "" || port == "" {
+			return false, 0
 		}
-		cl := &http.Client{Transport: tr, Timeout: timeout}
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, raw, nil)
+		addr := net.JoinHostPort(host, port)
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS13,
+		}
+		if net.ParseIP(host) == nil {
+			tlsConfig.ServerName = host
+		}
+		ctx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
 		start := time.Now()
-		resp, err := cl.Do(req)
+		conn, err := quic.DialAddr(ctx, addr, tlsConfig, &quic.Config{
+			MaxIdleTimeout: timeout,
+		})
 		if err != nil {
 			return false, time.Since(start)
 		}
-		resp.Body.Close()
+		_ = conn.CloseWithError(0, "probe")
+		return true, time.Since(start)
+	case "unix":
+		path := strings.TrimSpace(u.Path)
+		if path == "" {
+			path = strings.TrimSpace(u.Opaque)
+		}
+		if path == "" {
+			return false, 0
+		}
+		start := time.Now()
+		c, err := net.DialTimeout("unix", path, timeout)
+		if err != nil {
+			return false, time.Since(start)
+		}
+		_ = c.Close()
 		return true, time.Since(start)
 
 	default:
-		// For other schemes, try TCP to host:port if present.
+		// For TCP-like schemes (tcp/tls/ws/wss/socks/sockstls), probe host:port.
 		hostport := u.Host
 		if hostport == "" && u.Opaque != "" {
 			// support for forms like "scheme:host:port" without //
@@ -289,6 +322,48 @@ func CollectPeers(static []string, timeout time.Duration, maxParallel int) ([]st
 	return alive, nil
 }
 
+func mergePeersIntoConfig(path string, fallback *AppConfig, peers []string) ([]string, int, error) {
+	current, err := LoadOrInitAppConfig(path)
+	if err != nil {
+		if fallback == nil {
+			return nil, 0, err
+		}
+		merged := uniqUnion(fallback.Peers, peers)
+		return merged, len(merged) - len(fallback.Peers), err
+	}
+
+	before := len(current.Peers)
+	current.Peers = uniqUnion(current.Peers, peers)
+	added := len(current.Peers) - before
+	if added == 0 {
+		return current.Peers, 0, nil
+	}
+	if err := SaveJSON(path, current); err != nil {
+		return current.Peers, added, err
+	}
+	return current.Peers, added, nil
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // certFromPrivateKey creates a self-signed TLS cert using the provided ed25519 private key.
 func certFromPrivateKey(priv ed25519.PrivateKey) (*tls.Certificate, error) {
 	tpl := &x509.Certificate{
@@ -321,7 +396,10 @@ func hasUp(core *ycore.Core) bool {
 
 // notifyConnectivity invokes the connectivity handler if set.
 func notifyConnectivity(connected bool) {
-	if h := connectivityHandler; h != nil {
+	stateMu.RLock()
+	h := connectivityHandler
+	stateMu.RUnlock()
+	if h != nil {
 		h(connected)
 	}
 }

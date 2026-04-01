@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"crypto/ed25519"
@@ -35,7 +36,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
-const publicPeersURL = "https://publicpeers.neilalexander.dev/publicnodes.json"
+const (
+	publicPeersURL            = "https://publicpeers.neilalexander.dev/publicnodes.json"
+	coldStartBootstrapTimeout = 45 * time.Second
+)
 
 type quietLogger struct{}
 
@@ -52,12 +56,12 @@ func (l quietLogger) Debugln(...interface{})            {}
 func (l quietLogger) Traceln(...interface{})            {}
 
 var (
-	verbose  bool
-	maxPeers int
+	stateMu     sync.RWMutex
+	verbose     bool
+	maxPeers    int
+	maxPeersSet bool
+	defaultNode *Node
 )
-
-// defaultNode lets package-level helpers (ListenTCP/DialTCP) reuse the last created node.
-var defaultNode *Node
 
 // ConnectivityHandler is called whenever the node transitions between
 // connected and disconnected states.
@@ -67,19 +71,78 @@ var connectivityHandler ConnectivityHandler
 
 // SetConnectivityHandler installs a callback for connectivity state changes.
 // The callback is invoked on a background goroutine.
-func SetConnectivityHandler(h ConnectivityHandler) { connectivityHandler = h }
+func SetConnectivityHandler(h ConnectivityHandler) {
+	stateMu.Lock()
+	connectivityHandler = h
+	node := defaultNode
+	stateMu.Unlock()
+
+	if node == nil {
+		return
+	}
+	if h == nil {
+		node.stopConnectivityMonitor()
+		return
+	}
+	if !node.startConnectivityMonitor(3 * time.Second) {
+		go notifyConnectivity(node.Connected())
+	}
+}
 
 // SetVerbose enables or disables verbose logging from this package.
-func SetVerbose(v bool) { verbose = v }
+func SetVerbose(v bool) {
+	stateMu.Lock()
+	verbose = v
+	stateMu.Unlock()
+}
 
 // SetMaxPeers sets an upper bound on the number of peers to add at startup.
 // If n <= 0, there is no limit.
-func SetMaxPeers(n int) { maxPeers = n }
+func SetMaxPeers(n int) {
+	stateMu.Lock()
+	maxPeers = n
+	maxPeersSet = true
+	stateMu.Unlock()
+}
 
 func logV(format string, a ...interface{}) {
-	if verbose {
+	stateMu.RLock()
+	v := verbose
+	stateMu.RUnlock()
+	if v {
 		log.Printf(format, a...)
 	}
+}
+
+func configuredMaxPeers() int {
+	stateMu.RLock()
+	n := maxPeers
+	set := maxPeersSet
+	stateMu.RUnlock()
+	if !set {
+		return 100
+	}
+	return n
+}
+
+func setDefaultNode(node *Node) {
+	stateMu.Lock()
+	defaultNode = node
+	stateMu.Unlock()
+}
+
+func getDefaultNode() *Node {
+	stateMu.RLock()
+	node := defaultNode
+	stateMu.RUnlock()
+	return node
+}
+
+func hasConnectivityHandler() bool {
+	stateMu.RLock()
+	h := connectivityHandler != nil
+	stateMu.RUnlock()
+	return h
 }
 
 // New initializes (or loads) configuration from cfgPath, discovers peers, starts
@@ -88,10 +151,7 @@ func logV(format string, a ...interface{}) {
 // ~/.config/say/config.json). The caller owns the returned Node and may stop it
 // by calling Close().
 func New(cfgPath string) (*Node, error) {
-	// Default values if not set via setters.
-	if maxPeers == 0 {
-		maxPeers = 100
-	}
+	peerLimit := configuredMaxPeers()
 
 	// Resolve config path if caller left it empty.
 	if strings.TrimSpace(cfgPath) == "" {
@@ -114,6 +174,9 @@ func New(cfgPath string) (*Node, error) {
 			}
 		}
 	}
+	if strings.TrimSpace(cfgPath) == "" {
+		return nil, fmt.Errorf("config path could not be resolved")
+	}
 
 	logV("config path: %s", cfgPath)
 
@@ -125,11 +188,10 @@ func New(cfgPath string) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	if e := SaveJSON(cfgPath, ac); e != nil {
-		logV("warn: can't write config: %v", e)
-	} else {
-		logV("config saved (keys inline)")
+	if err := SaveJSON(cfgPath, ac); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
 	}
+	logV("config saved (keys inline)")
 
 	startPeers := time.Now()
 	logV("peers: static=%d", len(ac.Peers))
@@ -142,10 +204,14 @@ func New(cfgPath string) (*Node, error) {
 		if len(alive) == 0 {
 			// Fallback: try to fetch once synchronously
 			if fromURL, err := fetchPeersFromURL(2 * time.Second); err == nil {
-				ac.Peers = uniqUnion(ac.Peers, fromURL)
-				if e := SaveJSON(cfgPath, ac); e != nil {
-					logV("warn: can't save peers to config: %v", e)
+				mergedPeers, added, mergeErr := mergePeersIntoConfig(cfgPath, ac, fromURL)
+				if len(mergedPeers) > 0 {
+					ac.Peers = mergedPeers
 				}
+				if mergeErr != nil {
+					logV("warn: can't merge peers to config: %v", mergeErr)
+				}
+				logV("peers: merged_from_url=%d", added)
 				alive = FilterAlivePeers(ac.Peers, 2*time.Second, 16)
 				logV("peers: alive_after_merge=%d", len(alive))
 			}
@@ -160,57 +226,63 @@ func New(cfgPath string) (*Node, error) {
 				logV("peers refresh: fetch failed: %v", err)
 				return
 			}
-			before := len(ac.Peers)
-			ac.Peers = uniqUnion(ac.Peers, fromURL)
-			added := len(ac.Peers) - before
-			if added > 0 {
-				if e := SaveJSON(cfgPath, ac); e != nil {
-					logV("warn: can't save peers to config: %v", e)
-				}
+			mergedPeers, added, err := mergePeersIntoConfig(cfgPath, nil, fromURL)
+			if err != nil {
+				logV("peers refresh: merge failed: %v", err)
+				return
 			}
+			ac.Peers = mergedPeers
 			freshAlive := FilterAlivePeers(fromURL, 2*time.Second, 16)
-			logV("peers updated: %d total (added=%d, alive_new=%d)", len(ac.Peers), added, len(freshAlive))
+			logV("peers updated: %d total (added=%d, alive_new=%d)", len(mergedPeers), added, len(freshAlive))
 		}()
 	} else {
 		logV("fetching peers from %s", publicPeersURL)
-		// No peers in config: block until we fetch fresh peers (retry with backoff).
+		// No peers in config: block until we fetch fresh peers, but fail with a
+		// bounded timeout so callers are not stuck forever on a cold start.
+		bootstrapCtx, cancel := context.WithTimeout(context.Background(), coldStartBootstrapTimeout)
+		defer cancel()
 		backoff := 2 * time.Second
 		for {
 			fromURL, err := fetchPeersFromURL(2 * time.Second)
 			if err != nil {
 				logV("peers: fetch failed: %v; retrying in %s", err, backoff)
-				time.Sleep(backoff)
-				if backoff < 30*time.Second {
-					backoff *= 2
+			} else {
+				alive = FilterAlivePeers(fromURL, 2*time.Second, 16)
+				logV("peers: fetched=%d alive=%d (cold start)", len(fromURL), len(alive))
+				if len(alive) > 0 {
+					mergedPeers, added, mergeErr := mergePeersIntoConfig(cfgPath, ac, fromURL)
+					if len(mergedPeers) > 0 {
+						ac.Peers = mergedPeers
+					}
+					if mergeErr != nil {
+						logV("warn: can't merge peers to config: %v", mergeErr)
+					}
+					logV("peers: merged_from_url=%d", added)
+					break
 				}
-				continue
-			}
-			alive = FilterAlivePeers(fromURL, 2*time.Second, 16)
-			logV("peers: fetched=%d alive=%d (cold start)", len(fromURL), len(alive))
-			if len(alive) == 0 {
 				logV("peers: fetched but none alive; retrying in %s", backoff)
-				time.Sleep(backoff)
-				if backoff < 30*time.Second {
-					backoff *= 2
+			}
+			if err := sleepContext(bootstrapCtx, backoff); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					return nil, fmt.Errorf("bootstrap peers timeout after %s", coldStartBootstrapTimeout)
 				}
-				continue
+				return nil, fmt.Errorf("bootstrap peers: %w", err)
 			}
-			ac.Peers = uniqUnion(ac.Peers, fromURL)
-			if e := SaveJSON(cfgPath, ac); e != nil {
-				logV("warn: can't save peers to config: %v", e)
+			if backoff < 30*time.Second {
+				backoff *= 2
 			}
-			break
 		}
 	}
 
 	logV("peers: ready=%d (took %s)", len(alive), time.Since(startPeers).Truncate(time.Millisecond))
 
-	node, err := StartAndConnect(yc, alive, quietLogger{})
+	node, err := StartAndConnect(yc, alive, quietLogger{}, peerLimit)
 	if err != nil {
 		return nil, err
 	}
 	// Start in-process netstack immediately (single-mode runtime, no OS utun).
 	if _, err := node.StartNetstack(); err != nil {
+		_ = node.Close()
 		return nil, fmt.Errorf("start netstack: %w", err)
 	}
 
@@ -223,11 +295,11 @@ func New(cfgPath string) (*Node, error) {
 	}
 
 	// Start connectivity monitor if user installed a handler.
-	if connectivityHandler != nil {
+	if hasConnectivityHandler() {
 		node.startConnectivityMonitor(3 * time.Second)
 	}
 	// Expose as default for package-level helpers.
-	defaultNode = node
+	setDefaultNode(node)
 
 	return node, nil
 }
@@ -307,6 +379,9 @@ func (c *AppConfig) MarshalJSON() ([]byte, error) {
 }
 
 func LoadOrInitAppConfig(path string) (*AppConfig, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("empty config path")
+	}
 	b, err := os.ReadFile(path)
 	if err == nil {
 		var c AppConfig
@@ -324,10 +399,17 @@ func LoadOrInitAppConfig(path string) (*AppConfig, error) {
 		}
 		// If we had to add defaults, persist them back to the existing config file.
 		if changed {
-			_ = os.MkdirAll(filepath.Dir(path), 0o755)
-			_ = SaveJSON(path, &c)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return nil, err
+			}
+			if err := SaveJSON(path, &c); err != nil {
+				return nil, err
+			}
 		}
 		return &c, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
 	// Create a new config with sane defaults if the file does not exist yet.
 	c := &AppConfig{
@@ -644,14 +726,20 @@ func LoadOrInitAppConfig(path string) (*AppConfig, error) {
 		"tcp://ip6.nerdvm.mywire.org:8080?key=6342592a45a234afce0966610217f798e4898f6b1607d354fb126c239d05abf7",
 		"tcp://micr0.dev:7991",
 		"tls://micr0.dev:7992")
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = SaveJSON(path, c)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if err := SaveJSON(path, c); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
 // -------- Ygg cfg/keys --------
 
 type Node struct {
+	mu        sync.RWMutex
+	closed    bool
 	Core      *ycore.Core
 	Config    *ycfg.NodeConfig
 	monCancel context.CancelFunc
@@ -660,14 +748,65 @@ type Node struct {
 
 // Netstack wraps an in-process gVisor TCP/IP stack bridged to the Yggdrasil core via ipv6rwc.
 type Netstack struct {
-	Stack   *stack.Stack
-	NICID   tcpip.NICID
-	addr    tcpip.Address
-	mtu     uint32
-	rwc     io.ReadWriteCloser
-	chEP    *channel.Endpoint
-	stopCh  chan struct{}
-	stopped bool
+	mu        sync.RWMutex
+	closeOnce sync.Once
+	Stack     *stack.Stack
+	NICID     tcpip.NICID
+	addr      tcpip.Address
+	mtu       uint32
+	rwc       io.ReadWriteCloser
+	chEP      *channel.Endpoint
+	stopCh    chan struct{}
+	stopped   bool
+}
+
+func (n *Node) core() *ycore.Core {
+	if n == nil {
+		return nil
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.closed {
+		return nil
+	}
+	return n.Core
+}
+
+func (n *Node) netstack() *Netstack {
+	if n == nil {
+		return nil
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.closed {
+		return nil
+	}
+	if n.Net == nil || n.Net.isClosed() {
+		return nil
+	}
+	return n.Net
+}
+
+func (ns *Netstack) isClosed() bool {
+	if ns == nil {
+		return true
+	}
+	ns.mu.RLock()
+	defer ns.mu.RUnlock()
+	return ns.stopped
+}
+
+func (ns *Netstack) snapshot() (*stack.Stack, tcpip.NICID, tcpip.Address, error) {
+	var zero tcpip.Address
+	if ns == nil {
+		return nil, 0, zero, fmt.Errorf("netstack not started")
+	}
+	ns.mu.RLock()
+	defer ns.mu.RUnlock()
+	if ns.stopped || ns.Stack == nil {
+		return nil, 0, zero, fmt.Errorf("netstack not started")
+	}
+	return ns.Stack, ns.NICID, ns.addr, nil
 }
 
 // AddrString returns our Ygg IPv6 as string.
@@ -675,6 +814,8 @@ func (ns *Netstack) AddrString() string {
 	if ns == nil {
 		return ""
 	}
+	ns.mu.RLock()
+	defer ns.mu.RUnlock()
 	return ns.addr.String()
 }
 
@@ -683,42 +824,53 @@ func (ns *Netstack) Addr() net.IP {
 	if ns == nil {
 		return nil
 	}
-	ip := net.ParseIP(ns.addr.String())
+	ns.mu.RLock()
+	addr := ns.addr.String()
+	ns.mu.RUnlock()
+	ip := net.ParseIP(addr)
 	return ip
 }
 
 // Close stops pumps and releases resources.
 func (ns *Netstack) Close() error {
-	if ns == nil || ns.stopped {
+	if ns == nil {
 		return nil
 	}
-	ns.stopped = true
-	close(ns.stopCh)
-	if ns.chEP != nil {
-		ns.chEP.Close()
+	ns.closeOnce.Do(func() {
+		ns.mu.Lock()
+		ns.stopped = true
+		close(ns.stopCh)
+		chEP := ns.chEP
+		rwc := ns.rwc
 		ns.chEP = nil
-	}
-	if ns.rwc != nil {
-		_ = ns.rwc.Close()
 		ns.rwc = nil
-	}
-	ns.Stack = nil
-	ns.NICID = 0
-	logV("[netstack] closed")
+		ns.Stack = nil
+		ns.NICID = 0
+		ns.mu.Unlock()
+
+		if chEP != nil {
+			chEP.Close()
+		}
+		if rwc != nil {
+			_ = rwc.Close()
+		}
+		logV("[netstack] closed")
+	})
 	return nil
 }
 
 // ListenTCP exposes a net.Listener-like API backed by netstack.
 func (ns *Netstack) ListenTCP(port int) (net.Listener, error) {
-	if ns == nil || ns.Stack == nil {
-		return nil, fmt.Errorf("netstack not started")
+	st, nicID, addr, err := ns.snapshot()
+	if err != nil {
+		return nil, err
 	}
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", port)
 	}
-	logV("[p2p] [ns] listen tcp [%s]:%d", ns.addr.String(), port)
-	fa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr, Port: uint16(port)}
-	ln, err := gonet.ListenTCP(ns.Stack, fa, ipv6.ProtocolNumber)
+	logV("[p2p] [ns] listen tcp [%s]:%d", addr.String(), port)
+	fa := tcpip.FullAddress{NIC: nicID, Addr: addr, Port: uint16(port)}
+	ln, err := gonet.ListenTCP(st, fa, ipv6.ProtocolNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -727,8 +879,9 @@ func (ns *Netstack) ListenTCP(port int) (net.Listener, error) {
 
 // DialTCP dials a remote Ygg IPv6 + port through the in-process stack.
 func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (net.Conn, error) {
-	if ns == nil || ns.Stack == nil {
-		return nil, fmt.Errorf("netstack not started")
+	st, nicID, _, err := ns.snapshot()
+	if err != nil {
+		return nil, err
 	}
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", port)
@@ -752,7 +905,7 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 	logV("[p2p] [ns] dial tcp [%s]:%d", ip.String(), port)
 	var p16 [16]byte
 	copy(p16[:], ip)
-	rfa := tcpip.FullAddress{NIC: ns.NICID, Addr: tcpip.AddrFrom16(p16), Port: uint16(port)}
+	rfa := tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom16(p16), Port: uint16(port)}
 
 	// Apply optional timeout via context.
 	ctx := context.Background()
@@ -762,7 +915,7 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 		defer cancel()
 	}
 
-	c, err := gonet.DialContextTCP(ctx, ns.Stack, rfa, ipv6.ProtocolNumber)
+	c, err := gonet.DialContextTCP(ctx, st, rfa, ipv6.ProtocolNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -785,27 +938,29 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 
 // ListenUDP returns an unconnected UDP PacketConn bound to our Ygg IPv6. In gonet, DialUDP with raddr=nil yields an unconnected socket that supports ReadFrom/WriteTo.
 func (ns *Netstack) ListenUDP(port int) (net.PacketConn, error) {
-	if ns == nil || ns.Stack == nil {
-		return nil, fmt.Errorf("netstack not started")
+	st, nicID, addr, err := ns.snapshot()
+	if err != nil {
+		return nil, err
 	}
 	if port <= 0 || port > 65535 {
 		return nil, fmt.Errorf("invalid port %d", port)
 	}
 	// Bind a UDP endpoint without a remote; gonet.DialUDP(lfa, nil) returns an
 	// unconnected PacketConn that supports ReadFrom/WriteTo.
-	lfa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr, Port: uint16(port)}
-	pc, err := gonet.DialUDP(ns.Stack, &lfa, nil, ipv6.ProtocolNumber)
+	lfa := tcpip.FullAddress{NIC: nicID, Addr: addr, Port: uint16(port)}
+	pc, err := gonet.DialUDP(st, &lfa, nil, ipv6.ProtocolNumber)
 	if err != nil {
 		return nil, err
 	}
-	logV("[p2p] [ns] listen udp [%s]:%d", ns.addr.String(), port)
+	logV("[p2p] [ns] listen udp [%s]:%d", addr.String(), port)
 	return pc, nil
 }
 
 // DialUDP dials a remote Ygg IPv6 + port using UDP.
 func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (net.PacketConn, tcpip.FullAddress, error) {
-	if ns == nil || ns.Stack == nil {
-		return nil, tcpip.FullAddress{}, fmt.Errorf("netstack not started")
+	st, nicID, addr, err := ns.snapshot()
+	if err != nil {
+		return nil, tcpip.FullAddress{}, err
 	}
 	if port <= 0 || port > 65535 {
 		return nil, tcpip.FullAddress{}, fmt.Errorf("invalid port %d", port)
@@ -827,11 +982,11 @@ func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (n
 	}
 	var p16 [16]byte
 	copy(p16[:], ip)
-	rfa := tcpip.FullAddress{NIC: ns.NICID, Addr: tcpip.AddrFrom16(p16), Port: uint16(port)}
+	rfa := tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom16(p16), Port: uint16(port)}
 
 	// Bind ephemeral local UDP on our NIC/address.
-	lfa := tcpip.FullAddress{NIC: ns.NICID, Addr: ns.addr}
-	pc, err := gonet.DialUDP(ns.Stack, &lfa, &rfa, ipv6.ProtocolNumber)
+	lfa := tcpip.FullAddress{NIC: nicID, Addr: addr}
+	pc, err := gonet.DialUDP(st, &lfa, &rfa, ipv6.ProtocolNumber)
 	if err != nil {
 		return nil, tcpip.FullAddress{}, err
 	}
@@ -841,31 +996,40 @@ func (ns *Netstack) DialUDP(peerIPv6 string, port int, timeout time.Duration) (n
 
 // ListenTCP exposes a netstack-backed listener from the node.
 func (n *Node) ListenTCP(port int) (net.Listener, error) {
-	if n == nil || n.Net == nil {
+	ns := n.netstack()
+	if ns == nil {
 		return nil, fmt.Errorf("netstack not started")
 	}
-	return n.Net.ListenTCP(port)
+	return ns.ListenTCP(port)
 }
 
 // DialTCP dials a peer via this node's netstack with a default timeout.
 func (n *Node) DialTCP(peerIPv6 string, port int) (net.Conn, error) {
-	if n == nil || n.Net == nil {
+	ns := n.netstack()
+	if ns == nil {
 		return nil, fmt.Errorf("netstack not started")
 	}
-	return n.Net.DialTCP(peerIPv6, port, 10*time.Second)
+	return ns.DialTCP(peerIPv6, port, 10*time.Second)
 }
 
 // StartNetstack wires the Yggdrasil core to the gVisor netstack via an ipv6rwc/channel endpoint.
 func (n *Node) StartNetstack() (*Netstack, error) {
-	if n == nil || n.Core == nil {
+	if n == nil {
 		return nil, fmt.Errorf("ygg core not initialized")
 	}
-	// Guard: if already running and not stopped, return immediately.
-	if n.Net != nil && !n.Net.stopped {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed || n.Core == nil {
+		return nil, fmt.Errorf("ygg core not initialized")
+	}
+	if n.Net != nil && !n.Net.isClosed() {
 		return n.Net, nil
 	}
+	n.Net = nil
+
+	core := n.Core
 	// L3 R/W link to Ygg core.
-	rwc := ipv6rwc.NewReadWriteCloser(n.Core)
+	rwc := ipv6rwc.NewReadWriteCloser(core)
 	// Channel endpoint with larger queue and MTU 1280.
 	const mtu = 1280
 	ep := channel.New(4096, uint32(mtu), "ygg-chan")
@@ -873,6 +1037,13 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
+	cleanup := true
+	defer func() {
+		if cleanup {
+			ep.Close()
+			_ = rwc.Close()
+		}
+	}()
 	// Enlarge transport buffers to better absorb bursts.
 	_ = st.SetOption(tcpip.ReceiveBufferSizeOption{Min: 4 << 10, Default: 512 << 10, Max: 4 << 20})
 	_ = st.SetOption(tcpip.SendBufferSizeOption{Min: 4 << 10, Default: 512 << 10, Max: 4 << 20})
@@ -880,11 +1051,11 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &tcpip.TCPSendBufferSizeRangeOption{Min: 4 << 10, Default: 256 << 10, Max: 4 << 20})
 	nicID := tcpip.NICID(1)
 	if err := st.CreateNIC(nicID, ep); err != nil {
-		return nil, fmt.Errorf("create NIC: %w", err)
+		return nil, fmt.Errorf("create NIC: %v", err)
 	}
 	// Note: in this gVisor version, NIC is usable right after CreateNIC; no explicit SetNICUp.
 	// Our Ygg /128 address.
-	ya := n.Core.Address() // net.IP
+	ya := core.Address() // net.IP
 	if ya == nil || ya.To16() == nil || ya.To4() != nil {
 		return nil, fmt.Errorf("bad ygg address")
 	}
@@ -902,7 +1073,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 			PrefixLen: 128,
 		},
 	}, stack.AddressProperties{}); err != nil {
-		return nil, fmt.Errorf("add addr: %w", err)
+		return nil, fmt.Errorf("add addr: %v", err)
 	}
 	logV("[netstack] nic=%d ready, route 200::/7 via nic", nicID)
 	logV("[netstack] addr bound /128: %s", ya.String())
@@ -921,6 +1092,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	st.AddRoute(tcpip.Route{Destination: sub200, NIC: nicID})
 	ns := &Netstack{Stack: st, NICID: nicID, addr: yaddr, mtu: mtu, rwc: rwc, chEP: ep, stopCh: make(chan struct{})}
 	n.Net = ns
+	cleanup = false
 	// TX pump: packets from netstack -> ygg core.
 	go func() {
 		var txBytes uint64
@@ -1006,24 +1178,29 @@ var ErrNotConnected = errors.New("ygg: not connected")
 
 // Connected reports whether the node currently has at least one Up peer.
 func (n *Node) Connected() bool {
-	if n == nil || n.Core == nil {
+	core := n.core()
+	if core == nil {
 		return false
 	}
-	return hasUp(n.Core)
+	return hasUp(core)
 }
 
 // WaitConnected blocks until the node has at least one Up peer or the context
 // is cancelled. The check runs at the given interval; if interval <= 0, 500ms
 // is used. Returns nil when connected, ctx.Err() on cancellation/timeout.
 func (n *Node) WaitConnected(ctx context.Context, interval time.Duration) error {
-	if n == nil || n.Core == nil {
+	if n == nil {
+		return ErrNotConnected
+	}
+	core := n.core()
+	if core == nil {
 		return ErrNotConnected
 	}
 	if interval <= 0 {
 		interval = 500 * time.Millisecond
 	}
 	// Fast path: already connected
-	if hasUp(n.Core) {
+	if hasUp(core) {
 		return nil
 	}
 	t := time.NewTicker(interval)
@@ -1033,54 +1210,84 @@ func (n *Node) WaitConnected(ctx context.Context, interval time.Duration) error 
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			if hasUp(n.Core) {
+			core = n.core()
+			if core == nil {
+				return ErrNotConnected
+			}
+			if hasUp(core) {
 				return nil
 			}
 			// Nudge the core to retry peers faster while we wait
-			n.Core.RetryPeersNow()
+			core.RetryPeersNow()
 		}
 	}
 }
 
 // Close attempts to gracefully stop the underlying core, if supported.
 func (n *Node) Close() error {
-	// stop background monitor if running
-	if n != nil && n.monCancel != nil {
-		n.monCancel()
-		n.monCancel = nil
+	if n == nil {
+		return nil
 	}
-	// stop in-process netstack if running
-	if n != nil && n.Net != nil {
-		_ = n.Net.Close()
-		n.Net = nil
+
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		return nil
 	}
-	// try to stop the core gracefully if supported
-	type stopper interface{ Stop() }
-	if n != nil && n.Core != nil {
-		if s, ok := any(n.Core).(stopper); ok {
-			s.Stop()
-		}
+	n.closed = true
+	cancel := n.monCancel
+	n.monCancel = nil
+	netstack := n.Net
+	n.Net = nil
+	core := n.Core
+	n.Core = nil
+	n.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
+
+	if netstack != nil {
+		_ = netstack.Close()
+	}
+	if core != nil {
+		core.Stop()
+	}
+
+	stateMu.Lock()
+	if defaultNode == n {
+		defaultNode = nil
+	}
+	stateMu.Unlock()
+
 	return nil
 }
 
 // startConnectivityMonitor launches a lightweight connectivity watcher.
 // It sends an initial state and then only on changes. Callers stop it via Close().
-func (n *Node) startConnectivityMonitor(interval time.Duration) {
-	if n == nil || n.Core == nil {
-		return
+func (n *Node) startConnectivityMonitor(interval time.Duration) bool {
+	if n == nil {
+		return false
 	}
 	if interval <= 0 {
 		interval = 3 * time.Second
 	}
+
+	n.mu.Lock()
+	if n.closed || n.Core == nil || n.monCancel != nil {
+		n.mu.Unlock()
+		return false
+	}
+	core := n.Core
 	ctx, cancel := context.WithCancel(context.Background())
 	n.monCancel = cancel
+	n.mu.Unlock()
 
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 
-		prev := hasUp(n.Core)
+		prev := hasUp(core)
 		notifyConnectivity(prev)
 
 		for {
@@ -1088,7 +1295,7 @@ func (n *Node) startConnectivityMonitor(interval time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				cur := hasUp(n.Core)
+				cur := hasUp(core)
 				if cur != prev {
 					prev = cur
 					notifyConnectivity(cur)
@@ -1096,6 +1303,55 @@ func (n *Node) startConnectivityMonitor(interval time.Duration) {
 			}
 		}
 	}()
+	return true
+}
+
+func (n *Node) stopConnectivityMonitor() {
+	if n == nil {
+		return
+	}
+	n.mu.Lock()
+	cancel := n.monCancel
+	n.monCancel = nil
+	n.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+type peerAdder interface {
+	AddPeer(u *url.URL, sintf string) error
+}
+
+func addPersistentPeers(adder peerAdder, peers []string, maxPeers int) (int, error) {
+	if adder == nil {
+		return 0, fmt.Errorf("peer adder is nil")
+	}
+	added := 0
+	var errs []error
+	for _, p := range peers {
+		if maxPeers > 0 && added >= maxPeers {
+			break
+		}
+		u, err := url.Parse(strings.TrimSpace(p))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("parse %q: %w", p, err))
+			continue
+		}
+		if err := adder.AddPeer(u, ""); err != nil {
+			logV("core: skip peer %s: %v", p, err)
+			errs = append(errs, fmt.Errorf("add %q: %w", p, err))
+			continue
+		}
+		added++
+	}
+	if added > 0 {
+		return added, nil
+	}
+	if len(errs) == 0 {
+		return 0, fmt.Errorf("no peers added")
+	}
+	return 0, errors.Join(errs...)
 }
 
 // PrepareYggConfig generates or loads keys into ycfg.NodeConfig.
@@ -1157,7 +1413,7 @@ func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 }
 
 // StartAndConnect starts the core and connects to peers until the first one is up.
-func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) (*Node, error) {
+func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger, maxPeers int) (*Node, error) {
 	t0 := time.Now()
 	// Force core to use the same ed25519 key as in cfg.PrivateKey (ignore cfg.Certificate).
 	if len(cfg.PrivateKey) != ed25519.PrivateKeySize {
@@ -1199,17 +1455,16 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 	if err != nil {
 		return nil, err
 	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			core.Stop()
+		}
+	}()
 	logV("core: adding peers=%d", len(peers))
-	// Add peers to the autodial table.
-	added := 0
-	for _, p := range peers {
-		if maxPeers > 0 && added >= maxPeers {
-			break
-		}
-		if u, e := url.Parse(p); e == nil {
-			_ = core.AddPeer(u, "")
-			added++
-		}
+	added, err := addPersistentPeers(core, peers, maxPeers)
+	if err != nil {
+		return nil, fmt.Errorf("add peers: %w", err)
 	}
 	logV("core: added peers=%d (max=%d)", added, maxPeers)
 	core.RetryPeersNow()
@@ -1233,6 +1488,7 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 			}
 			if ok {
 				logV("connect: first_up in %s", time.Since(t0).Truncate(time.Millisecond))
+				cleanup = false
 				return &Node{Core: core, Config: cfg}, nil
 			}
 			core.RetryPeersNow()
@@ -1242,36 +1498,48 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) 
 
 // ListenTCP listens on the current default node's user-space netstack.
 func ListenTCP(port int) (net.Listener, error) {
-	if defaultNode == nil || defaultNode.Net == nil {
+	node := getDefaultNode()
+	if node == nil || node.netstack() == nil {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
-	return defaultNode.ListenTCP(port)
+	return node.ListenTCP(port)
 }
 
 // DialTCP dials a peer over the current default node's user-space netstack.
 func DialTCP(peerIPv6 string, port int) (net.Conn, error) {
-	if defaultNode == nil || defaultNode.Net == nil {
+	node := getDefaultNode()
+	if node == nil || node.netstack() == nil {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
-	return defaultNode.DialTCP(peerIPv6, port)
+	return node.DialTCP(peerIPv6, port)
 }
 
 // ListenUDP listens on the current default node's user-space netstack and returns
 // a PacketConn bound to our Ygg IPv6 on the given port. Packets can be ReadFrom/WriteTo.
 func ListenUDP(port int) (net.PacketConn, error) {
-	if defaultNode == nil || defaultNode.Net == nil {
+	node := getDefaultNode()
+	if node == nil {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
-	return defaultNode.Net.ListenUDP(port)
+	ns := node.netstack()
+	if ns == nil {
+		return nil, fmt.Errorf("ygg: default node not initialized")
+	}
+	return ns.ListenUDP(port)
 }
 
 // DialUDP dials a peer over the current default node's user-space netstack and returns
 // a connected PacketConn (Write/Read without specifying addr each time).
 func DialUDP(peerIPv6 string, port int) (net.PacketConn, error) {
-	if defaultNode == nil || defaultNode.Net == nil {
+	node := getDefaultNode()
+	if node == nil {
 		return nil, fmt.Errorf("ygg: default node not initialized")
 	}
-	pc, _, err := defaultNode.Net.DialUDP(peerIPv6, port, 10*time.Second)
+	ns := node.netstack()
+	if ns == nil {
+		return nil, fmt.Errorf("ygg: default node not initialized")
+	}
+	pc, _, err := ns.DialUDP(peerIPv6, port, 10*time.Second)
 	return pc, err
 }
 

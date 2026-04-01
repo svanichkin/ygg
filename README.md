@@ -60,7 +60,7 @@ If none is found, a new configuration is generated.
 
 ## Environment and Dependencies
 
-- **Language:** Go 1.21+
+- **Language:** Go 1.25.5+
 - **Dependencies:**
   - `github.com/yggdrasil-network/yggdrasil-go`
 
