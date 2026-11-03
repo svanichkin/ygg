@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,8 +36,7 @@ import (
 )
 
 const (
-	publicPeersURL            = "https://publicpeers.neilalexander.dev/publicnodes.json"
-	coldStartBootstrapTimeout = 45 * time.Second
+	publicPeersURL = "https://publicpeers.neilalexander.dev/publicnodes.json"
 )
 
 type quietLogger struct{}
@@ -96,8 +94,8 @@ func SetVerbose(v bool) {
 	stateMu.Unlock()
 }
 
-// SetMaxPeers sets an upper bound on the number of peers to add at startup.
-// If n <= 0, there is no limit.
+// SetMaxPeers sets how many best peers (by measured RTT) the node keeps.
+// The default is 8. If n <= 0, every reachable peer is kept.
 func SetMaxPeers(n int) {
 	stateMu.Lock()
 	maxPeers = n
@@ -120,7 +118,7 @@ func configuredMaxPeers() int {
 	set := maxPeersSet
 	stateMu.RUnlock()
 	if !set {
-		return 100
+		return defaultMaxPeers
 	}
 	return n
 }
@@ -151,8 +149,6 @@ func hasConnectivityHandler() bool {
 // ~/.config/say/config.json). The caller owns the returned Node and may stop it
 // by calling Close().
 func New(cfgPath string) (*Node, error) {
-	peerLimit := configuredMaxPeers()
-
 	// Resolve config path if caller left it empty.
 	if strings.TrimSpace(cfgPath) == "" {
 		if exe, err := os.Executable(); err == nil {
@@ -193,93 +189,34 @@ func New(cfgPath string) (*Node, error) {
 	}
 	logV("config saved (keys inline)")
 
-	startPeers := time.Now()
-	logV("peers: static=%d", len(ac.Peers))
-	var alive []string
-	if len(ac.Peers) > 0 {
-		logV("bg: fetching peers from %s", publicPeersURL)
-		// We have peers in config: start ASAP with those that are alive.
-		alive = FilterAlivePeers(ac.Peers, 2*time.Second, 16)
-		logV("peers: alive_from_config=%d", len(alive))
-		if len(alive) == 0 {
-			// Fallback: try to fetch once synchronously
-			if fromURL, err := fetchPeersFromURL(2 * time.Second); err == nil {
-				mergedPeers, added, mergeErr := mergePeersIntoConfig(cfgPath, ac, fromURL)
-				if len(mergedPeers) > 0 {
-					ac.Peers = mergedPeers
-				}
-				if mergeErr != nil {
-					logV("warn: can't merge peers to config: %v", mergeErr)
-				}
-				logV("peers: merged_from_url=%d", added)
-				alive = FilterAlivePeers(ac.Peers, 2*time.Second, 16)
-				logV("peers: alive_after_merge=%d", len(alive))
-			}
-			if len(alive) == 0 {
-				return nil, fmt.Errorf("peers: no alive peers")
-			}
-		}
-		// Background one-shot refresh from URL (non-blocking).
-		go func() {
-			fromURL, err := fetchPeersFromURL(5 * time.Second)
-			if err != nil {
-				logV("peers refresh: fetch failed: %v", err)
-				return
-			}
-			mergedPeers, added, err := mergePeersIntoConfig(cfgPath, nil, fromURL)
-			if err != nil {
-				logV("peers refresh: merge failed: %v", err)
-				return
-			}
-			ac.Peers = mergedPeers
-			freshAlive := FilterAlivePeers(fromURL, 2*time.Second, 16)
-			logV("peers updated: %d total (added=%d, alive_new=%d)", len(mergedPeers), added, len(freshAlive))
-		}()
-	} else {
-		logV("fetching peers from %s", publicPeersURL)
-		// No peers in config: block until we fetch fresh peers, but fail with a
-		// bounded timeout so callers are not stuck forever on a cold start.
-		bootstrapCtx, cancel := context.WithTimeout(context.Background(), coldStartBootstrapTimeout)
-		defer cancel()
-		backoff := 2 * time.Second
-		for {
-			fromURL, err := fetchPeersFromURL(2 * time.Second)
-			if err != nil {
-				logV("peers: fetch failed: %v; retrying in %s", err, backoff)
-			} else {
-				alive = FilterAlivePeers(fromURL, 2*time.Second, 16)
-				logV("peers: fetched=%d alive=%d (cold start)", len(fromURL), len(alive))
-				if len(alive) > 0 {
-					mergedPeers, added, mergeErr := mergePeersIntoConfig(cfgPath, ac, fromURL)
-					if len(mergedPeers) > 0 {
-						ac.Peers = mergedPeers
-					}
-					if mergeErr != nil {
-						logV("warn: can't merge peers to config: %v", mergeErr)
-					}
-					logV("peers: merged_from_url=%d", added)
-					break
-				}
-				logV("peers: fetched but none alive; retrying in %s", backoff)
-			}
-			if err := sleepContext(bootstrapCtx, backoff); err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
-					return nil, fmt.Errorf("bootstrap peers timeout after %s", coldStartBootstrapTimeout)
-				}
-				return nil, fmt.Errorf("bootstrap peers: %w", err)
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
-		}
-	}
-
-	logV("peers: ready=%d (took %s)", len(alive), time.Since(startPeers).Truncate(time.Millisecond))
-
-	node, err := StartAndConnect(yc, alive, quietLogger{}, peerLimit)
+	t0 := time.Now()
+	core, err := startCore(yc, quietLogger{})
 	if err != nil {
 		return nil, err
 	}
+	node := &Node{Core: core, Config: yc}
+
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+	defer cancel()
+
+	// Saved peers first: after the first run these are the best verified ones.
+	logV("peers: saved=%d", len(ac.Peers))
+	err = connectFirst(ctx, core, &node.peers, ac.Peers)
+	if err != nil {
+		// Saved peers are gone or the config is empty: try the public list.
+		logV("peers: saved peers failed (%v), fetching %s", err, publicPeersURL)
+		fresh := fetchCandidates(5 * time.Second)
+		if len(fresh) == 0 {
+			_ = node.Close()
+			return nil, fmt.Errorf("connect: %w (public peer list unavailable)", err)
+		}
+		if err = connectFirst(ctx, core, &node.peers, fresh); err != nil {
+			_ = node.Close()
+			return nil, fmt.Errorf("connect: %w", err)
+		}
+	}
+	logV("connect: first peer up in %s", time.Since(t0).Truncate(time.Millisecond))
+
 	// Start in-process netstack immediately (single-mode runtime, no OS utun).
 	if _, err := node.StartNetstack(); err != nil {
 		_ = node.Close()
@@ -293,6 +230,9 @@ func New(cfgPath string) (*Node, error) {
 	} else {
 		logV("connected: %s", addr.String())
 	}
+
+	// Keep the node on the best peers in the background.
+	node.startPeerManager(cfgPath, ac.PeersCheckedAt)
 
 	// Start connectivity monitor if user installed a handler.
 	if hasConnectivityHandler() {
@@ -312,8 +252,12 @@ func init() {
 type AppConfig struct {
 	// Seed is the inline private key seed (empty => generate).
 	Seed string `json:"seed,omitempty"`
-	// Peers lists static peers (tcp://host:port, tls://..., quic://...).
+	// Peers is the peer list (tcp://host:port, tls://..., quic://...). After
+	// the first check it holds only the best peers that completed a real
+	// Yggdrasil handshake, ordered by RTT.
 	Peers []string `json:"peers"`
+	// PeersCheckedAt is when all candidates were last re-checked.
+	PeersCheckedAt time.Time `json:"peers_checked_at,omitzero"`
 	// DialTimeoutSec controls connect timeouts.
 	DialTimeoutSec int `json:"dial_timeout_sec,omitempty"`
 	raw            map[string]json.RawMessage
@@ -321,9 +265,10 @@ type AppConfig struct {
 
 func (c *AppConfig) UnmarshalJSON(data []byte) error {
 	type alias struct {
-		Seed           string   `json:"seed,omitempty"`
-		Peers          []string `json:"peers"`
-		DialTimeoutSec int      `json:"dial_timeout_sec,omitempty"`
+		Seed           string    `json:"seed,omitempty"`
+		Peers          []string  `json:"peers"`
+		PeersCheckedAt time.Time `json:"peers_checked_at,omitzero"`
+		DialTimeoutSec int       `json:"dial_timeout_sec,omitempty"`
 	}
 	var a alias
 	if err := json.Unmarshal(data, &a); err != nil {
@@ -331,6 +276,7 @@ func (c *AppConfig) UnmarshalJSON(data []byte) error {
 	}
 	c.Seed = a.Seed
 	c.Peers = a.Peers
+	c.PeersCheckedAt = a.PeersCheckedAt
 	c.DialTimeoutSec = a.DialTimeoutSec
 	if c.Peers == nil {
 		c.Peers = []string{}
@@ -366,6 +312,15 @@ func (c *AppConfig) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	raw["peers"] = b
+	if !c.PeersCheckedAt.IsZero() {
+		b, err = json.Marshal(c.PeersCheckedAt)
+		if err != nil {
+			return nil, err
+		}
+		raw["peers_checked_at"] = b
+	} else {
+		delete(raw, "peers_checked_at")
+	}
 	if c.DialTimeoutSec != 0 {
 		b, err = json.Marshal(c.DialTimeoutSec)
 		if err != nil {
@@ -417,315 +372,250 @@ func LoadOrInitAppConfig(path string) (*AppConfig, error) {
 		DialTimeoutSec: 3,
 		raw:            map[string]json.RawMessage{},
 	}
-	c.Peers = append(c.Peers, "tcp://37.186.113.100:1514",
-		"quic://37.186.113.100:1515",
-		"tls://37.186.113.100:1515",
-		"ws://37.186.113.100:1516",
-		"wss://ygg-evn-1.wgos.org:443",
-		"tls://syd.joel.net.au:8443",
-		"tls://sirsegv.moe:7676",
-		"tls://yg-syd.magicum.net:23700",
-		"quic://yg-syd.magicum.net:23701",
-		"tls://yg-mel.magicum.net:23800",
-		"quic://yg-mel.magicum.net:23801",
+	c.Peers = append(c.Peers, "tcp://109.107.177.127:65535",
+		"quic://109.107.177.127:65535",
 		"tls://109.176.250.101:65534",
-		"tls://[2a02:1b8:10:147::1:1ea]:65534",
-		"quic://ip6.casa2.mywire.org:44443?key=000000003cb1cc50e05147fc548f6d1f78e7ffcdc67b456f9bb0db6f0a5e4723",
-		"tcp://Yggdrasil.UnderEu.Net:37001",
-		"quic://Yggdrasil.UnderEu.Net:37003",
-		"quic://ip6.casa2.mywire.org:44443?key=af4885c078c705dc0e21a696171f3d7878c48bd47164571590f29f38ed5a4573",
-		"quic://scarlet.mboa.dev:3443",
-		"tcp://ygg.nadeko.net:44441",
-		"tls://ygg.nadeko.net:44442",
-		"tls://[2a03:3b40:fe:ab::1]:993",
-		"tls://37.205.14.171:993",
-		"tcp://ygg-hel-1.wgos.org:45170",
-		"tls://ygg-hel-1.wgos.org:45171",
-		"quic://ygg-hel-1.wgos.org:45171",
-		"ws://ygg-hel-1.wgos.org:45172",
-		"tls://[2a01:4f9:2b:2d8f::2]:1337",
-		"tls://95.217.35.92:1337",
-		"tcp://[2001:470:1f13:e56::64]:39565",
-		"tls://[2001:470:1f13:e56::64]:39575",
-		"tcp://62.210.85.80:39565",
-		"tls://62.210.85.80:39575",
-		"tcp://s2.i2pd.xyz:39565",
-		"tls://s2.i2pd.xyz:39575",
-		"tcp://51.15.204.214:12345",
-		"tls://51.15.204.214:54321",
-		"tcp://yggpeer.tilde.green:53299",
-		"tls://yggpeer.tilde.green:59454",
-		"quic://yggpeer.tilde.green:62265",
-		"tls://ygg.jholden.org:1555",
-		"tls://n.ygg.yt:443",
-		"quic://ip4.fvm.mywire.org:443?key=000000000143db657d1d6f80b5066dd109a4cb31f7dc6cb5d56050fffb014217",
-		"tcp://ip4.fvm.mywire.org:8080?key=000000000143db657d1d6f80b5066dd109a4cb31f7dc6cb5d56050fffb014217",
-		"quic://ip6.fvm.mywire.org:443?key=000000000143db657d1d6f80b5066dd109a4cb31f7dc6cb5d56050fffb014217",
-		"tcp://ip6.fvm.mywire.org:8080?key=000000000143db657d1d6f80b5066dd109a4cb31f7dc6cb5d56050fffb014217",
-		"tls://b.ygg.yt:443",
-		"tls://g.ygg.yt:443",
-		"tcp://ygg1.mk16.de:1337?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
-		"tls://ygg1.mk16.de:1338?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
-		"tcp://[2a0b:4142:e9e::2]:65535",
-		"tcp://94.159.111.184:65535",
-		"tls://vpn.ltha.de:443?key=0000006149970f245e6cec43664bce203f2514b60a153e194f31e2b229a1339d",
-		"tcp://[2a0b:4142:ce0::2]:65535",
-		"tcp://94.159.110.4:65535",
-		"tcp://yggdrasil.su:62486",
-		"tls://yggdrasil.su:62586",
-		"tcp://87.251.77.39:65535",
-		"quic://87.251.77.39:65535",
-		"quic://[2a0c:b641:ce0::25d8:c5d6]:65535",
-		"tcp://[2a0c:b641:ce0::25d8:c5d6]:65535",
-		"quic://31.57.241.104:65535",
-		"tcp://31.57.241.104:65535",
-		"tcp://ygg2.mk16.de:1337?key=000000d80a2d7b3126ea65c8c08fc751088c491a5cdd47eff11c86fa1e4644ae",
-		"tls://ygg2.mk16.de:1338?key=000000d80a2d7b3126ea65c8c08fc751088c491a5cdd47eff11c86fa1e4644ae",
-		"tls://helium.avevad.com:1337",
-		"tcp://ygg.mkg20001.io:80",
-		"tls://ygg.mkg20001.io:443",
-		"tls://91.98.126.143:32000",
-		"tls://yggdrasil.neilalexander.dev:64648?key=ecbbcb3298e7d3b4196103333c3e839cfe47a6ca47602b94a6d596683f6bb358",
-		"tcp://bode.theender.net:42069",
-		"tls://bode.theender.net:42169?key=f91b909f43829f8b20732b3bcf80cbc4bb078dd47b41638379a078e35984c9a4",
-		"quic://[2a0b:4142:e9e::2]:65535",
-		"quic://94.159.111.184:65535",
-		"quic://[2a0b:4142:ce0::2]:65535",
-		"quic://94.159.110.4:65535",
-		"tls://de-fsn-1.peer.v4.yggdrasil.chaz6.com:4444",
-		"tls://mlupo.duckdns.org:9001",
-		"tls://yg-hkg.magicum.net:32333",
-		"quic://yg-hkg.magicum.net:32334",
-		"ws://ygg1.grin.hu:42443",
-		"tls://ygg1.grin.hu:42444",
-		"tls://astrra.space:55535",
+		"quic://129.80.167.244:23165",
 		"tls://133.18.201.69:54232",
-		"tls://153.120.42.137:54232",
-		"tls://yg-tyo.magicum.net:32333",
-		"quic://yg-tyo.magicum.net:32334",
-		"tls://srl.newsdeef.eu:59999",
-		"tcp://srl.newsdeef.eu:9999",
-		"tcp://vpn.itrus.su:7991",
-		"tls://vpn.itrus.su:7992",
-		"quic://vpn.itrus.su:7993",
-		"ws://vpn.itrus.su:7994",
-		"tcp://146.103.111.53:65535",
-		"tcp://[2a14:1e00:3:15c::]:65535",
-		"tcp://109.107.177.127:65535",
-		"tcp://[2a0d:8480:3:234c::]:65535",
-		"quic://[2a14:1e00:1:ecd::]:65535",
-		"tcp://[2a14:1e00:1:ecd::]:65535",
-		"quic://5.35.70.181:65535",
-		"tcp://5.35.70.181:65535",
-		"tcp://[2a14:1e00:1:f3c::]:65535",
-		"quic://[2a14:1e00:1:f3c::]:65535",
-		"quic://89.110.116.167:65535",
-		"tcp://89.110.116.167:65535",
-		"tcp://212.34.131.160:65535",
-		"quic://212.34.131.160:65535",
-		"tcp://[2a14:1e00:1:bae::]:65535",
-		"quic://[2a14:1e00:1:bae::]:65535",
 		"tcp://146.103.107.222:65535",
 		"quic://146.103.107.222:65535",
+		"tcp://146.103.111.53:65535",
+		"quic://146.103.111.53:65535",
+		"tls://153.120.42.137:54232",
+		"tls://192.3.13.16:8118",
+		"tls://194.55.165.115:443?key=84a4e510bd5528d25cf17ac44d47168c4600110f32e8e8ca10d3c103f4e73aa4",
+		"tcp://194.55.165.115:80?key=84a4e510bd5528d25cf17ac44d47168c4600110f32e8e8ca10d3c103f4e73aa4",
+		"tls://[2001:470:1f13:e56::64]:39575",
+		"tcp://[2001:470:1f13:e56::64]:39565",
+		"tcp://212.34.131.160:65535",
+		"quic://212.34.131.160:65535",
+		"tls://23.184.48.86:1443",
+		"quic://23.184.48.86:1443",
+		"quic://[2603:c020:4015:b937:a1c7:aff8:b558:d1fe]:23165",
+		"tls://[2a02:1b8:10:147::1:1ea]:65534",
+		"tls://[2a03:3b40:fe:ab::1]:993?key=0009e16b9e3afe7b13c3612560410434d3dfc70c8a8a0a63e51e0470cb8124f6",
+		"tls://[2a0c:5cc0:1:1::83f4:cbd8]:443?key=84a4e510bd5528d25cf17ac44d47168c4600110f32e8e8ca10d3c103f4e73aa4",
+		"tcp://[2a0c:5cc0:1:1::83f4:cbd8]:80?key=84a4e510bd5528d25cf17ac44d47168c4600110f32e8e8ca10d3c103f4e73aa4",
+		"tcp://[2a0d:8480:1:209e::]:65535",
+		"quic://[2a0d:8480:1:209e::]:65535",
+		"tcp://[2a0d:8480:3:234c::]:65535",
+		"quic://[2a0d:8480:3:234c::]:65535",
+		"tcp://[2a14:1e00:1:bae::]:65535",
+		"quic://[2a14:1e00:1:bae::]:65535",
+		"tcp://[2a14:1e00:1:ecd::]:65535",
+		"quic://[2a14:1e00:1:ecd::]:65535",
+		"tcp://[2a14:1e00:1:f3c::]:65535",
+		"quic://[2a14:1e00:1:f3c::]:65535",
+		"tcp://[2a14:1e00:3:15c::]:65535",
+		"quic://[2a14:1e00:3:15c::]:65535",
 		"tcp://[2a14:1e00:3:2b2::]:65535",
 		"quic://[2a14:1e00:3:2b2::]:65535",
-		"tls://23.137.249.65:444",
-		"quic://[2a0d:8480:1:209e::]:65535",
-		"tcp://[2a0d:8480:1:209e::]:65535",
-		"tcp://88.210.10.78:65535",
-		"quic://88.210.10.78:65535",
-		"tcp://thatmaidguy.fvds.ru:7991",
-		"quic://146.103.111.53:65535",
-		"quic://[2a14:1e00:3:15c::]:65535",
-		"quic://109.107.177.127:65535",
-		"quic://[2a0d:8480:3:234c::]:65535",
-		"tcp://ygg-nl.incognet.io:8883",
-		"tls://ygg-nl.incognet.io:8884",
-		"quic://ygg-nl.incognet.io:8885",
-		"ws://ygg-nl.incognet.io:8886",
-		"quic://185.181.60.111:1513?key=00defa4b4b243547f2d5641ac5235ff1e35d393c576e4bb9cd45baefc81e48d9",
-		"tls://185.181.60.111:1513?key=00defa4b4b243547f2d5641ac5235ff1e35d393c576e4bb9cd45baefc81e48d9",
-		"quic://[2a03:94e0:ffff:185:181:60:0:111]:1513?key=00defa4b4b243547f2d5641ac5235ff1e35d393c576e4bb9cd45baefc81e48d9",
-		"tls://[2a03:94e0:ffff:185:181:60:0:111]:1513?key=00defa4b4b243547f2d5641ac5235ff1e35d393c576e4bb9cd45baefc81e48d9",
-		"tls://185.165.169.234:8443",
-		"tcp://185.165.169.234:8880",
-		"tcp://45.137.99.182:1337",
-		"tcp://srv.itrus.su:7991",
-		"tls://srv.itrus.su:7992",
-		"quic://srv.itrus.su:7993",
-		"ws://srv.itrus.su:7994",
-		"quic://ip4.01.msk.ru.dioni.su:9002",
-		"tcp://ip4.01.msk.ru.dioni.su:9002",
-		"tls://ip4.01.msk.ru.dioni.su:9003",
-		"ws://ip4.01.msk.ru.dioni.su:9004",
-		"quic://ip6.01.msk.ru.dioni.su:9002",
-		"tcp://ip6.01.msk.ru.dioni.su:9002",
-		"tls://ip6.01.msk.ru.dioni.su:9003",
-		"ws://ip6.01.msk.ru.dioni.su:9004",
-		"tcp://ip4.01.ekb.ru.dioni.su:9002",
-		"quic://ip4.01.ekb.ru.dioni.su:9002",
-		"tls://ip4.01.ekb.ru.dioni.su:9003",
-		"ws://ip4.01.ekb.ru.dioni.su:9004",
-		"tcp://ip6.01.ekb.ru.dioni.su:9002",
-		"quic://ip6.01.ekb.ru.dioni.su:9002",
-		"tls://ip6.01.ekb.ru.dioni.su:9003",
-		"ws://ip6.01.ekb.ru.dioni.su:9004",
-		"tcp://ip4.01.tom.ru.dioni.su:9002",
-		"quic://ip4.01.tom.ru.dioni.su:9002",
-		"tls://ip4.01.tom.ru.dioni.su:9003",
-		"ws://ip4.01.tom.ru.dioni.su:9004",
-		"tcp://[2a09:5302:ffff::132a]:65535",
-		"quic://[2a09:5302:ffff::132a]:65535",
-		"quic://89.44.86.85:65535",
-		"tcp://89.44.86.85:65535",
-		"tls://[2a09:5302:ffff::992]:443",
-		"tcp://[2a09:5302:ffff::992]:12403",
-		"tls://45.95.202.21:443",
-		"tcp://45.95.202.21:12403",
-		"tls://[2a00:b700::a:279]:443",
-		"tcp://[2a00:b700::a:279]:12402",
-		"tls://45.147.200.202:443",
-		"tcp://45.147.200.202:12402",
-		"ws://kursk.cleverfox.org:15016",
-		"tcp://ygg-msk-1.averyan.ru:8363",
-		"tcp://box.paulll.cc:13337",
-		"tls://box.paulll.cc:13338",
-		"tcp://188.225.9.167:18226",
-		"tls://188.225.9.167:18227",
-		"tcp://yggno.de:18226",
-		"tls://yggno.de:18227",
+		"tls://31.22.111.195:32000",
+		"tls://37.186.113.100:1515",
+		"tcp://37.186.113.100:1514",
+		"quic://37.186.113.100:1515",
+		"ws://37.186.113.100:1516",
 		"tls://37.192.232.33:442",
 		"tcp://37.192.232.33:8080",
-		"tcp://yg-vvo.magicum.net:29330",
-		"tls://yg-vvo.magicum.net:29331",
-		"tcp://itcom.multed.com:7991",
-		"tcp://195.58.51.167:7991",
-		"tls://195.58.51.167:7992",
-		"ws://195.58.51.167:7993",
-		"tcp://kzn1.neonxp.ru:7991",
-		"tls://kzn1.neonxp.ru:7992",
-		"ws://kzn1.neonxp.ru:7993",
-		"tcp://ekb.itrus.su:7991",
-		"tls://ekb.itrus.su:7992",
+		"tls://37.205.14.171:993?key=0009e16b9e3afe7b13c3612560410434d3dfc70c8a8a0a63e51e0470cb8124f6",
+		"tls://5.252.118.13:443",
+		"tcp://5.252.118.13:65535",
+		"quic://5.252.118.13:65535",
+		"tcp://5.35.70.181:65535",
+		"quic://5.35.70.181:65535",
+		"tls://51.15.204.214:54321",
+		"tcp://51.15.204.214:12345",
+		"tls://62.210.85.80:39575",
+		"tcp://62.210.85.80:39565",
+		"tcp://87.251.77.39:65535",
+		"quic://87.251.77.39:65535",
+		"tcp://88.210.10.78:65535",
+		"quic://88.210.10.78:65535",
+		"tcp://89.110.116.167:65535",
+		"quic://89.110.116.167:65535",
+		"tls://91.98.161.68:9001?key=0e638944bfd6b277fa5e0dddbeb4444778eea8bece63a9862c661797022a8f05",
+		"tls://asia.deinfra.org:15015",
+		"quic://asia.deinfra.org:15015",
+		"tls://bode.theender.net:42169?key=f91b909f43829f8b20732b3bcf80cbc4bb078dd47b41638379a078e35984c9a4",
+		"tcp://bode.theender.net:42069",
+		"tls://box.paulll.cc:13338",
+		"tcp://box.paulll.cc:13337",
+		"tls://ca.us.ygg.informatics.coop:443?key=0000000023fc6ffb62afb79448aefb0943df2e4472cf08bd489f5407378300a2",
+		"tls://cirno.nadeko.net:44442",
+		"tcp://cirno.nadeko.net:44441",
+		"tls://cowgl.tech:1337",
+		"tls://dc.txlyre.website:1337",
+		"tcp://dc.txlyre.website:13372",
+		"quic://dc.txlyre.website:13371",
+		"ws://dc.txlyre.website:13370",
+		"tls://des.8px.sk:4321",
+		"quic://des.8px.sk:4321",
+		"wss://donotclickthis.link:443/api/v2/socket",
 		"quic://ekb.itrus.su:7993",
-		"ws://ekb.itrus.su:7994",
-		"tcp://yggdrasil.1337.moe:7676",
-		"tcp://91.220.109.93:8080",
+		"quic://ip4.fvm.mywire.org:443?key=000000000143db657d1d6f80b5066dd109a4cb31f7dc6cb5d56050fffb014217",
+		"tcp://ip4.nerdvm.mywire.org:8080?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
+		"quic://ip4.nerdvm.mywire.org:443?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
+		"quic://ip6.casa2.mywire.org:44443?key=000000003cb1cc50e05147fc548f6d1f78e7ffcdc67b456f9bb0db6f0a5e4723",
+		"tcp://ip6.fvm.mywire.org:8080?key=000000000143db657d1d6f80b5066dd109a4cb31f7dc6cb5d56050fffb014217",
+		"quic://ip6.fvm.mywire.org:443?key=000000000143db657d1d6f80b5066dd109a4cb31f7dc6cb5d56050fffb014217",
+		"tcp://ip6.nerdvm.mywire.org:8080?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
+		"quic://ip6.nerdvm.mywire.org:443?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
+		"tcp://itcom.multed.com:7991",
+		"tls://ke46138.ddns.net:12345",
+		"quic://ke46138.ddns.net:12345",
+		"tls://kem.txlyre.website:14437",
+		"tcp://kem.txlyre.website:1337",
+		"quic://kem.txlyre.website:13337",
 		"tls://kursk.cleverfox.org:15015",
 		"quic://kursk.cleverfox.org:15015",
-		"tls://ygg-msk-1.averyan.ru:8362",
-		"quic://ygg-msk-1.averyan.ru:8364",
-		"quic://vix.duckdns.org:36014",
-		"tls://vix.duckdns.org:36014",
-		"quic://195.58.51.167:7994",
-		"quic://kzn1.neonxp.ru:7994",
-		"tcp://195.2.74.155:7991",
-		"tls://195.2.74.155:7992",
-		"ws://195.2.74.155:7993",
-		"quic://195.2.74.155:7994",
-		"tcp://msk1.neonxp.ru:7991",
-		"tls://msk1.neonxp.ru:7992",
-		"ws://msk1.neonxp.ru:7993",
-		"quic://msk1.neonxp.ru:7994",
-		"tcp://pp1.ygg.sy.sa:8441",
-		"tls://pp1.ygg.sy.sa:8442",
-		"quic://pp1.ygg.sy.sa:8443",
-		"quic://asia.deinfra.org:15015",
-		"tls://asia.deinfra.org:15015",
-		"tcp://y.zbin.eu:7743",
-		"tcp://yggdrasil.deavmi.assigned.network:2000",
-		"tls://yggdrasil.deavmi.assigned.network:2001",
-		"tcp://[2a04:5b81:2011:1:dea6:32ff:fe0b:b610]:2000",
-		"tls://[2a04:5b81:2011:1:dea6:32ff:fe0b:b610]:2001",
-		"quic://spain.magicum.net:36900",
-		"tls://spain.magicum.net:36901",
-		"tcp://rendezvous.anton.molyboha.me:50421",
-		"quic://[2a12:5940:b1a0::2]:65535",
-		"tcp://[2a12:5940:b1a0::2]:65535",
-		"quic://77.91.84.76:65535",
-		"tcp://77.91.84.76:65535",
-		"tcp://ygg.ace.ctrl-c.liu.se:9998?key=5636b3af4738c3998284c4805d91209cab38921159c66a6f359f3f692af1c908",
-		"tls://ygg.ace.ctrl-c.liu.se:9999?key=5636b3af4738c3998284c4805d91209cab38921159c66a6f359f3f692af1c908",
-		"tcp://sysop.link:555",
-		"quic://sysop.link:555",
-		"tcp://sto01.yggdrasil.hosted-by.skhron.eu:8883",
-		"tls://sto01.yggdrasil.hosted-by.skhron.eu:8884",
-		"quic://sto01.yggdrasil.hosted-by.skhron.eu:8885",
-		"ws://sto01.yggdrasil.hosted-by.skhron.eu:8886",
-		"tls://193.93.119.42:443",
-		"ws://193.93.119.42:850",
-		"quic://193.93.119.42:1443",
-		"tcp://193.93.119.42:14244",
-		"quic://yggdrasil.sunsung.fun:4441",
-		"tcp://yggdrasil.sunsung.fun:4442",
-		"tls://yggdrasil.sunsung.fun:4443",
-		"tls://78.27.153.163:179",
-		"tls://78.27.153.163:3784",
-		"tls://78.27.153.163:3785",
-		"tcp://78.27.153.163:33165",
-		"tls://78.27.153.163:33166",
-		"tls://london.sabretruth.org:18472",
-		"tcp://london.sabretruth.org:18473",
-		"tls://ygg.jjolly.dev:3443",
-		"quic://ip4.nerdvm.mywire.org:443?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
-		"tcp://ip4.nerdvm.mywire.org:8080?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
-		"quic://ip6.nerdvm.mywire.org:443?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
-		"tcp://ip6.nerdvm.mywire.org:8080?key=00000000c61d731961a290d127cd3fc03a4c5f3f35b9083559d4c81d48d65854",
-		"tcp://ygg3.mk16.de:1337?key=000003acdaf2a60e8de2f63c3e63b7e911d02380934f09ee5c83acb758f470c1",
-		"tls://ygg3.mk16.de:1338?key=000003acdaf2a60e8de2f63c3e63b7e911d02380934f09ee5c83acb758f470c1",
-		"tls://23.184.48.86:993",
-		"quic://23.184.48.86:993",
-		"quic://[2602:fc24:18:7a42::1]:993",
-		"tls://[2602:fc24:18:7a42::1]:993",
-		"tls://209.205.228.160:5621",
-		"quic://mo.us.ygg.triplebit.org:443",
+		"ws://kursk.cleverfox.org:15016",
+		"tls://leo.node.3dt.net:9003",
+		"tcp://leo.node.3dt.net:9002",
+		"quic://leo.node.3dt.net:9004",
+		"tls://longseason.1200bps.xyz:13122",
+		"tcp://longseason.1200bps.xyz:13121",
+		"tls://marisa.nadeko.net:44442",
+		"tcp://marisa.nadeko.net:44441",
+		"tcp://mn.us.ygg.triplebit.org:9000",
+		"quic://mn.us.ygg.triplebit.org:443",
 		"tls://mo.us.ygg.triplebit.org:993",
 		"tcp://mo.us.ygg.triplebit.org:9000",
+		"quic://mo.us.ygg.triplebit.org:443",
 		"ws://mo.us.ygg.triplebit.org:9010",
-		"tcp://leo.node.3dt.net:9002",
-		"tls://leo.node.3dt.net:9003",
-		"quic://leo.node.3dt.net:9004",
-		"tcp://ygg-kcmo.incognet.io:8883",
+		"tls://mskaeza.i113d.ru:12632",
+		"tcp://mskaeza.i113d.ru:12631",
+		"ws://mskaeza.i113d.ru:12634",
+		"tls://nl1.route172.de:443?key=000000002643ae27bad63e2a81f1d30554ce9ea634f5990062a9e079e23593cd",
+		"tls://no0.yggdrasil.netralex.com:65534?key=f4b9fe4f9923834b1c20f84e13b14d90ecde443f78613ec54cf484eea6880fea",
+		"tcp://no0.yggdrasil.netralex.com:65533?key=f4b9fe4f9923834b1c20f84e13b14d90ecde443f78613ec54cf484eea6880fea",
+		"quic://no0.yggdrasil.netralex.com:65535?key=f4b9fe4f9923834b1c20f84e13b14d90ecde443f78613ec54cf484eea6880fea",
+		"quic://peer.ryebreads.xyz:12345",
+		"tls://r1.worcester.yggdrasil.novasredes.network:2001",
+		"tcp://r1.worcester.yggdrasil.novasredes.network:2000",
+		"tls://r2.worcester.yggdrasil.novasredes.network:2001",
+		"tcp://r2.worcester.yggdrasil.novasredes.network:2000",
+		"tls://ralsei.ru:12345",
+		"quic://ralsei.ru:12345",
+		"tcp://rendezvous.anton.molyboha.me:50421",
+		"tls://reticulum.me:12393?key=a3d411280dfc350a4484aa3da5feb0407518c5820cbb011d5620347769b26665",
+		"tls://s2.i2pd.xyz:39575",
+		"tcp://s2.i2pd.xyz:39565",
+		"tls://satori.nadeko.net:44442",
+		"tcp://satori.nadeko.net:44441",
+		"tls://scandic.us:2012",
+		"tcp://scandic.us:2011",
+		"ws://scandic.us:2014",
+		"quic://scarlet.mboa.dev:3443",
+		"tls://se.laerad.top:54001?key=29512833cbca43f1f0bb1833d0edcb45791e66f7955c577b57fd0fc78892e2f8",
+		"quic://se.laerad.top:54001?key=29512833cbca43f1f0bb1833d0edcb45791e66f7955c577b57fd0fc78892e2f8",
+		"tls://server.i113d.ru:12632",
+		"tcp://server.i113d.ru:12631",
+		"ws://server.i113d.ru:12634",
+		"tls://sirsegv.moe:7676",
+		"tls://sto01.yggdrasil.hosted-by.skhron.eu:8884?key=ce8cfa43b8c9e71c1fe31832b39403f23166f2bac12d52c755d9ac68f55da81c",
+		"tcp://sto01.yggdrasil.hosted-by.skhron.eu:8883?key=ce8cfa43b8c9e71c1fe31832b39403f23166f2bac12d52c755d9ac68f55da81c",
+		"quic://sto01.yggdrasil.hosted-by.skhron.eu:8885?key=ce8cfa43b8c9e71c1fe31832b39403f23166f2bac12d52c755d9ac68f55da81c",
+		"ws://sto01.yggdrasil.hosted-by.skhron.eu:8886?key=ce8cfa43b8c9e71c1fe31832b39403f23166f2bac12d52c755d9ac68f55da81c",
+		"tls://supanadit.com:15021",
+		"quic://supanadit.com:15022",
+		"tls://syd.joel.net.au:8443",
+		"tcp://u-neroit.ru:7000",
+		"tls://uk-lon1.ygg-public-peers.h.wer.ee:17161",
+		"tcp://uk-lon1.ygg-public-peers.h.wer.ee:17160",
+		"tls://us.laerad.top:54001?key=c81bc11f522837d2def65768a2593e30cdfa65de856fa129f1aa18e55ba3a484",
+		"quic://us.laerad.top:54001?key=c81bc11f522837d2def65768a2593e30cdfa65de856fa129f1aa18e55ba3a484",
+		"tls://vix.duckdns.org:36014",
+		"quic://vix.duckdns.org:36014",
+		"tls://vpn.itrus.su:7992",
+		"tcp://vpn.itrus.su:7991",
+		"quic://vpn.itrus.su:7993",
+		"ws://vpn.itrus.su:7994",
+		"tls://waw01.yggdrasil.hosted-by.skhron.eu:8884?key=030602cee88a761c68f5f14e1dad430f25238a703b69dc382321a38f833035b0",
+		"tcp://waw01.yggdrasil.hosted-by.skhron.eu:8883?key=030602cee88a761c68f5f14e1dad430f25238a703b69dc382321a38f833035b0",
+		"quic://waw01.yggdrasil.hosted-by.skhron.eu:8885?key=030602cee88a761c68f5f14e1dad430f25238a703b69dc382321a38f833035b0",
+		"ws://waw01.yggdrasil.hosted-by.skhron.eu:8886?key=030602cee88a761c68f5f14e1dad430f25238a703b69dc382321a38f833035b0",
+		"tcp://y.zbin.eu:7743",
+		"tcp://yg-mel.magicum.net:23801",
+		"tls://yg-ovb.magicum.net:32333",
+		"tcp://yg-ovb.magicum.net:32332",
+		"tls://yg-sin.magicum.net:23900",
+		"tcp://yg-sin.magicum.net:23901",
+		"tls://yg-syd.magicum.net:23700",
+		"tcp://yg-syd.magicum.net:23701",
+		"tls://yg-tyo.magicum.net:32333",
+		"tcp://yg-tyo.magicum.net:32334",
+		"tls://yg-vvo.magicum.net:29331",
+		"tcp://yg-vvo.magicum.net:29330",
+		"tcp://ygg-1.okade.pro:20000",
+		"wss://ygg-evn-1.wgos.org:443",
 		"tls://ygg-kcmo.incognet.io:8884",
+		"tcp://ygg-kcmo.incognet.io:8883",
 		"quic://ygg-kcmo.incognet.io:8885",
 		"ws://ygg-kcmo.incognet.io:8886",
-		"quic://mn.us.ygg.triplebit.org:443",
-		"tls://mn.us.ygg.triplebit.org:993",
-		"tcp://mn.us.ygg.triplebit.org:9000",
-		"ws://mn.us.ygg.triplebit.org:9010",
-		"tcp://neo.node.3dt.net:9002",
-		"tls://neo.node.3dt.net:9003",
-		"quic://neo.node.3dt.net:9004",
-		"tcp://longseason.1200bps.xyz:13121",
-		"tls://longseason.1200bps.xyz:13122",
-		"tcp://srv.newsdeef.eu:9999",
-		"tls://srv.newsdeef.eu:59999",
-		"tcp://ygg-pa.incognet.io:8883",
+		"tls://ygg-ke.8px.sk:4321",
+		"quic://ygg-ke.8px.sk:4321",
 		"tls://ygg-pa.incognet.io:8884",
+		"tcp://ygg-pa.incognet.io:8883",
 		"quic://ygg-pa.incognet.io:8885",
 		"ws://ygg-pa.incognet.io:8886",
-		"tcp://129.80.167.244:23163",
-		"tls://129.80.167.244:23164",
-		"quic://129.80.167.244:23165",
-		"ws://129.80.167.244:23166",
-		"tcp://[2603:c020:4015:b937:a1c7:aff8:b558:d1fe]:23163",
-		"tls://[2603:c020:4015:b937:a1c7:aff8:b558:d1fe]:23164",
-		"quic://[2603:c020:4015:b937:a1c7:aff8:b558:d1fe]:23165",
-		"ws://[2603:c020:4015:b937:a1c7:aff8:b558:d1fe]:23166",
-		"tcp://ygg-wa.incognet.io:8883",
+		"tls://ygg-ro.axxa.dev:18080",
 		"tls://ygg-wa.incognet.io:8884",
+		"tcp://ygg-wa.incognet.io:8883",
 		"quic://ygg-wa.incognet.io:8885",
 		"ws://ygg-wa.incognet.io:8886",
-		"quic://redcatho.de:9494",
-		"tls://redcatho.de:9494",
+		"tcp://ygg.bruijn.nu:65535",
+		"quic://ygg.bruijn.nu:65535",
+		"tls://ygg.jholden.org:1555",
+		"tls://ygg.med-dev-systems.ru:6221",
+		"tls://ygg.mkg20001.io:443",
+		"tcp://ygg.mkg20001.io:80",
 		"tls://ygg.mnpnk.com:443",
-		"tls://44.234.134.124:443",
-		"quic://ip4.nerdvm.mywire.org:443?key=6342592a45a234afce0966610217f798e4898f6b1607d354fb126c239d05abf7",
-		"tcp://ip4.nerdvm.mywire.org:8080?key=6342592a45a234afce0966610217f798e4898f6b1607d354fb126c239d05abf7",
-		"quic://ip6.nerdvm.mywire.org:443?key=6342592a45a234afce0966610217f798e4898f6b1607d354fb126c239d05abf7",
-		"tcp://ip6.nerdvm.mywire.org:8080?key=6342592a45a234afce0966610217f798e4898f6b1607d354fb126c239d05abf7",
-		"tcp://micr0.dev:7991",
-		"tls://micr0.dev:7992")
+		"tls://ygg.nadeko.net:44442",
+		"tcp://ygg.nadeko.net:44441",
+		"tcp://ygg1.asriyan.me:23672",
+		"tls://ygg1.grin.hu:42444",
+		"ws://ygg1.grin.hu:42443",
+		"tls://ygg1.mk16.de:1338?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
+		"tcp://ygg1.mk16.de:1337?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
+		"quic://ygg1.mk16.de:1339?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
+		"ws://ygg1.mk16.de:1340?key=0000000087ee9949eeab56bd430ee8f324cad55abf3993ed9b9be63ce693e18a",
+		"tls://ygg2.mk16.de:1338?key=000000d80a2d7b3126ea65c8c08fc751088c491a5cdd47eff11c86fa1e4644ae",
+		"tcp://ygg2.mk16.de:1337?key=000000d80a2d7b3126ea65c8c08fc751088c491a5cdd47eff11c86fa1e4644ae",
+		"quic://ygg2.mk16.de:1339?key=000000d80a2d7b3126ea65c8c08fc751088c491a5cdd47eff11c86fa1e4644ae",
+		"ws://ygg2.mk16.de:1340?key=000000d80a2d7b3126ea65c8c08fc751088c491a5cdd47eff11c86fa1e4644ae",
+		"tls://ygg3.mk16.de:1338?key=000003acdaf2a60e8de2f63c3e63b7e911d02380934f09ee5c83acb758f470c1",
+		"tcp://ygg3.mk16.de:1337?key=000003acdaf2a60e8de2f63c3e63b7e911d02380934f09ee5c83acb758f470c1",
+		"quic://ygg3.mk16.de:1339?key=000003acdaf2a60e8de2f63c3e63b7e911d02380934f09ee5c83acb758f470c1",
+		"ws://ygg3.mk16.de:1340?key=000003acdaf2a60e8de2f63c3e63b7e911d02380934f09ee5c83acb758f470c1",
+		"tls://ygg4.mk16.de:1338?key=000000573433e11f23768b078bcdc10b42712a7b131d6d04b82042ffc0c97df0",
+		"tcp://ygg4.mk16.de:1337?key=000000573433e11f23768b078bcdc10b42712a7b131d6d04b82042ffc0c97df0",
+		"quic://ygg4.mk16.de:1339?key=000000573433e11f23768b078bcdc10b42712a7b131d6d04b82042ffc0c97df0",
+		"ws://ygg4.mk16.de:1340?key=000000573433e11f23768b078bcdc10b42712a7b131d6d04b82042ffc0c97df0",
+		"tls://ygg5.mk16.de:1338?key=0000009611ae5391dc0aceea9f3fa6a0dc1279f4306059339e84bfb8b74d2f9b",
+		"tcp://ygg5.mk16.de:1337?key=0000009611ae5391dc0aceea9f3fa6a0dc1279f4306059339e84bfb8b74d2f9b",
+		"quic://ygg5.mk16.de:1339?key=0000009611ae5391dc0aceea9f3fa6a0dc1279f4306059339e84bfb8b74d2f9b",
+		"ws://ygg5.mk16.de:1340?key=0000009611ae5391dc0aceea9f3fa6a0dc1279f4306059339e84bfb8b74d2f9b",
+		"tls://ygg7.mk16.de:1338?key=000000086278b5f3ba1eb63acb5b7f6e406f04ce83990dee9c07f49011e375ae",
+		"tcp://ygg7.mk16.de:1337?key=000000086278b5f3ba1eb63acb5b7f6e406f04ce83990dee9c07f49011e375ae",
+		"quic://ygg7.mk16.de:1339?key=000000086278b5f3ba1eb63acb5b7f6e406f04ce83990dee9c07f49011e375ae",
+		"ws://ygg7.mk16.de:1340?key=000000086278b5f3ba1eb63acb5b7f6e406f04ce83990dee9c07f49011e375ae",
+		"tls://ygg8.mk16.de:1338?key=0000000b0683e38d8cb3085cfbf217edf0f0b2de76bb5ac7f02a94cd42a3fed9",
+		"tcp://ygg8.mk16.de:1337?key=0000000b0683e38d8cb3085cfbf217edf0f0b2de76bb5ac7f02a94cd42a3fed9",
+		"quic://ygg8.mk16.de:1339?key=0000000b0683e38d8cb3085cfbf217edf0f0b2de76bb5ac7f02a94cd42a3fed9",
+		"ws://ygg8.mk16.de:1340?key=0000000b0683e38d8cb3085cfbf217edf0f0b2de76bb5ac7f02a94cd42a3fed9",
+		"tls://yggdrasil.neilalexander.dev:64648?key=ecbbcb3298e7d3b4196103333c3e839cfe47a6ca47602b94a6d596683f6bb358",
+		"tls://yggdrasil.su:62586",
+		"tcp://yggdrasil.su:62486",
+		"tls://yggdrasil.sunsung.fun:4443",
+		"tcp://yggdrasil.sunsung.fun:4442",
+		"quic://yggdrasil.sunsung.fun:4441",
+		"tcp://Yggdrasil.UnderEu.Net:37001",
+		"quic://Yggdrasil.UnderEu.Net:37003",
+		"tls://yggno.de:18227",
+		"tcp://yggno.de:18226",
+		"tls://yggpeer.tilde.green:59454",
+		"tcp://yggpeer.tilde.green:53299",
+		"quic://yggpeer.tilde.green:62265")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -744,6 +634,9 @@ type Node struct {
 	Config    *ycfg.NodeConfig
 	monCancel context.CancelFunc
 	Net       *Netstack
+
+	peerCancel context.CancelFunc // stops the background peer manager
+	peers      peerSet            // full URIs of peers added to Core
 }
 
 // Netstack wraps an in-process gVisor TCP/IP stack bridged to the Yggdrasil core via ipv6rwc.
@@ -1237,6 +1130,8 @@ func (n *Node) Close() error {
 	n.closed = true
 	cancel := n.monCancel
 	n.monCancel = nil
+	peerCancel := n.peerCancel
+	n.peerCancel = nil
 	netstack := n.Net
 	n.Net = nil
 	core := n.Core
@@ -1245,6 +1140,9 @@ func (n *Node) Close() error {
 
 	if cancel != nil {
 		cancel()
+	}
+	if peerCancel != nil {
+		peerCancel()
 	}
 
 	if netstack != nil {
@@ -1319,41 +1217,6 @@ func (n *Node) stopConnectivityMonitor() {
 	}
 }
 
-type peerAdder interface {
-	AddPeer(u *url.URL, sintf string) error
-}
-
-func addPersistentPeers(adder peerAdder, peers []string, maxPeers int) (int, error) {
-	if adder == nil {
-		return 0, fmt.Errorf("peer adder is nil")
-	}
-	added := 0
-	var errs []error
-	for _, p := range peers {
-		if maxPeers > 0 && added >= maxPeers {
-			break
-		}
-		u, err := url.Parse(strings.TrimSpace(p))
-		if err != nil {
-			errs = append(errs, fmt.Errorf("parse %q: %w", p, err))
-			continue
-		}
-		if err := adder.AddPeer(u, ""); err != nil {
-			logV("core: skip peer %s: %v", p, err)
-			errs = append(errs, fmt.Errorf("add %q: %w", p, err))
-			continue
-		}
-		added++
-	}
-	if added > 0 {
-		return added, nil
-	}
-	if len(errs) == 0 {
-		return 0, fmt.Errorf("no peers added")
-	}
-	return 0, errors.Join(errs...)
-}
-
 // PrepareYggConfig generates or loads keys into ycfg.NodeConfig.
 func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 	cfg := ycfg.GenerateConfig() // sane defaults; will be overridden below.
@@ -1412,9 +1275,8 @@ func PrepareYggConfig(app *AppConfig) (*ycfg.NodeConfig, error) {
 	return cfg, nil
 }
 
-// StartAndConnect starts the core and connects to peers until the first one is up.
-func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger, maxPeers int) (*Node, error) {
-	t0 := time.Now()
+// startCore creates a core with the key from cfg and no peers.
+func startCore(cfg *ycfg.NodeConfig, logger ycore.Logger) (*ycore.Core, error) {
 	// Force core to use the same ed25519 key as in cfg.PrivateKey (ignore cfg.Certificate).
 	if len(cfg.PrivateKey) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("cfg.PrivateKey length=%d, want %d", len(cfg.PrivateKey), ed25519.PrivateKeySize)
@@ -1451,49 +1313,39 @@ func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger, 
 
 	// Note: we do not request OS TUN here. The process runs in user-space mode
 	// and exposes L3 via ipv6rwc to an in-process netstack (configured elsewhere).
-	core, err := ycore.New(cert, logger, opts...)
+	return ycore.New(cert, logger, opts...)
+}
+
+// StartAndConnect starts the core and adds peers batch by batch until the
+// first one completes the Yggdrasil handshake. It does not run the background
+// peer manager; New does.
+func StartAndConnect(cfg *ycfg.NodeConfig, peers []string, logger ycore.Logger) (*Node, error) {
+	core, err := startCore(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			core.Stop()
-		}
-	}()
-	logV("core: adding peers=%d", len(peers))
-	added, err := addPersistentPeers(core, peers, maxPeers)
-	if err != nil {
-		return nil, fmt.Errorf("add peers: %w", err)
-	}
-	logV("core: added peers=%d (max=%d)", added, maxPeers)
-	core.RetryPeersNow()
-
-	// Wait for the first Up peer.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	node := &Node{Core: core, Config: cfg}
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
-	tick := time.NewTicker(500 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("connect timeout")
-		case <-tick.C:
-			ok := false
-			for _, pi := range core.GetPeers() {
-				if pi.Up {
-					ok = true
-					break
-				}
-			}
-			if ok {
-				logV("connect: first_up in %s", time.Since(t0).Truncate(time.Millisecond))
-				cleanup = false
-				return &Node{Core: core, Config: cfg}, nil
-			}
-			core.RetryPeersNow()
-		}
+	if err := connectFirst(ctx, core, &node.peers, peers); err != nil {
+		core.Stop()
+		return nil, fmt.Errorf("connect: %w", err)
 	}
+	return node, nil
+}
+
+// startPeerManager runs runPeerManager until Close.
+func (n *Node) startPeerManager(cfgPath string, lastFull time.Time) {
+	ctx, cancel := context.WithCancel(context.Background())
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		cancel()
+		return
+	}
+	n.peerCancel = cancel
+	n.mu.Unlock()
+	go n.runPeerManager(ctx, cfgPath, lastFull)
 }
 
 // ListenTCP listens on the current default node's user-space netstack.
