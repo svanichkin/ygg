@@ -18,6 +18,7 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/hjson/hjson-go/v4 v4.7.1 // indirect
 	github.com/quic-go/quic-go v0.65.0 // indirect
+	github.com/wlynxg/anet v0.0.5 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect

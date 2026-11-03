@@ -22,6 +22,7 @@ import (
 	ycfg "github.com/yggdrasil-network/yggdrasil-go/src/config"
 	ycore "github.com/yggdrasil-network/yggdrasil-go/src/core"
 	ipv6rwc "github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
+	ymc "github.com/yggdrasil-network/yggdrasil-go/src/multicast"
 
 	// gVisor netstack dependencies
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -196,6 +197,18 @@ func New(cfgPath string) (*Node, error) {
 	}
 	node := &Node{Core: core, Config: yc}
 
+	// LAN discovery starts before the internet peers, so a node in the
+	// same network can be the first peer.
+	if on, password := lanSettings(ac); on {
+		mc, err := startLAN(core, yc, password, quietLogger{})
+		if err != nil {
+			_ = node.Close()
+			return nil, fmt.Errorf("start lan discovery: %w", err)
+		}
+		node.lan = mc
+		logV("lan: discovery on (password set: %t)", password != "")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
 
@@ -205,17 +218,23 @@ func New(cfgPath string) (*Node, error) {
 	if err != nil {
 		// Saved peers are gone or the config is empty: try the public list.
 		logV("peers: saved peers failed (%v), fetching %s", err, publicPeersURL)
-		fresh := fetchCandidates(5 * time.Second)
-		if len(fresh) == 0 {
-			_ = node.Close()
-			return nil, fmt.Errorf("connect: %w (public peer list unavailable)", err)
-		}
-		if err = connectFirst(ctx, core, &node.peers, fresh); err != nil {
-			_ = node.Close()
-			return nil, fmt.Errorf("connect: %w", err)
+		if fresh := fetchCandidates(5 * time.Second); len(fresh) == 0 {
+			err = fmt.Errorf("%w (public peer list unavailable)", err)
+		} else {
+			err = connectFirst(ctx, core, &node.peers, fresh)
 		}
 	}
-	logV("connect: first peer up in %s", time.Since(t0).Truncate(time.Millisecond))
+	switch {
+	case err == nil:
+		logV("connect: first peer up in %s", time.Since(t0).Truncate(time.Millisecond))
+	case node.lan != nil:
+		// No internet peers, but nodes in the local network may still come:
+		// start anyway, peers keep being retried in the background.
+		logV("connect: %v; starting anyway, LAN discovery is on", err)
+	default:
+		_ = node.Close()
+		return nil, fmt.Errorf("connect: %w", err)
+	}
 
 	// Start in-process netstack immediately (single-mode runtime, no OS utun).
 	if _, err := node.StartNetstack(); err != nil {
@@ -260,7 +279,12 @@ type AppConfig struct {
 	PeersCheckedAt time.Time `json:"peers_checked_at,omitzero"`
 	// DialTimeoutSec controls connect timeouts.
 	DialTimeoutSec int `json:"dial_timeout_sec,omitempty"`
-	raw            map[string]json.RawMessage
+	// LAN turns on peer discovery in the local network (see SetLAN).
+	LAN bool `json:"lan,omitempty"`
+	// LANPassword: only nodes with the same password peer in the local
+	// network. Empty: any Yggdrasil node.
+	LANPassword string `json:"lan_password,omitempty"`
+	raw         map[string]json.RawMessage
 }
 
 func (c *AppConfig) UnmarshalJSON(data []byte) error {
@@ -269,6 +293,8 @@ func (c *AppConfig) UnmarshalJSON(data []byte) error {
 		Peers          []string  `json:"peers"`
 		PeersCheckedAt time.Time `json:"peers_checked_at,omitzero"`
 		DialTimeoutSec int       `json:"dial_timeout_sec,omitempty"`
+		LAN            bool      `json:"lan,omitempty"`
+		LANPassword    string    `json:"lan_password,omitempty"`
 	}
 	var a alias
 	if err := json.Unmarshal(data, &a); err != nil {
@@ -278,6 +304,8 @@ func (c *AppConfig) UnmarshalJSON(data []byte) error {
 	c.Peers = a.Peers
 	c.PeersCheckedAt = a.PeersCheckedAt
 	c.DialTimeoutSec = a.DialTimeoutSec
+	c.LAN = a.LAN
+	c.LANPassword = a.LANPassword
 	if c.Peers == nil {
 		c.Peers = []string{}
 	}
@@ -329,6 +357,20 @@ func (c *AppConfig) MarshalJSON() ([]byte, error) {
 		raw["dial_timeout_sec"] = b
 	} else {
 		delete(raw, "dial_timeout_sec")
+	}
+	if c.LAN {
+		raw["lan"] = json.RawMessage("true")
+	} else {
+		delete(raw, "lan")
+	}
+	if c.LANPassword != "" {
+		b, err = json.Marshal(c.LANPassword)
+		if err != nil {
+			return nil, err
+		}
+		raw["lan_password"] = b
+	} else {
+		delete(raw, "lan_password")
 	}
 	return json.Marshal(raw)
 }
@@ -637,6 +679,7 @@ type Node struct {
 
 	peerCancel context.CancelFunc // stops the background peer manager
 	peers      peerSet            // full URIs of peers added to Core
+	lan        *ymc.Multicast     // LAN discovery, nil when off
 }
 
 // Netstack wraps an in-process gVisor TCP/IP stack bridged to the Yggdrasil core via ipv6rwc.
@@ -1136,6 +1179,8 @@ func (n *Node) Close() error {
 	n.Net = nil
 	core := n.Core
 	n.Core = nil
+	lan := n.lan
+	n.lan = nil
 	n.mu.Unlock()
 
 	if cancel != nil {
@@ -1147,6 +1192,9 @@ func (n *Node) Close() error {
 
 	if netstack != nil {
 		_ = netstack.Close()
+	}
+	if lan != nil {
+		_ = lan.Stop()
 	}
 	if core != nil {
 		core.Stop()

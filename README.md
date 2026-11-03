@@ -10,6 +10,7 @@ Ygg is a lightweight Go library that embeds a self-contained Yggdrasil node — 
 - 📡 **Graceful shutdown** — stop the node cleanly with `node.Close()`.
 - 🪶 **Library-friendly API** — import and start with a single call.
 - 🔔 **Connectivity events** — receive callbacks when the node connects or disconnects.
+- 🏠 **LAN discovery** — nodes in one local network find each other and peer directly, optionally only with a shared password.
 
 ## Installation
 
@@ -63,6 +64,8 @@ If none is found, a new configuration is generated.
 | `seed` | Private key seed (base64url). Generated on first run. |
 | `peers` | Peer list. A new config starts with a built-in list; after the first check it holds only the best verified peers, ordered by RTT. |
 | `peers_checked_at` | When all candidates were last re-checked. |
+| `lan` | `true` turns on peer discovery in the local network (off by default). |
+| `lan_password` | Only nodes with the same password peer in the local network. Empty: any Yggdrasil node. At most 64 bytes. |
 
 ## Peer Selection
 
@@ -87,6 +90,33 @@ forged answer comes from nearby, such fake peers would look the fastest.
    Old peers are removed only after a selected one is up. The re-check runs
    every 6 hours, and earlier if fewer than 2 peers stay up.
 
+## LAN Discovery
+
+Nodes in one local network (one Wi-Fi or Ethernet segment) can find each other
+by link-local IPv6 multicast beacons and peer directly — no internet and no
+public peers needed. This is the standard Yggdrasil multicast discovery.
+
+```go
+ygg.SetLAN(true, "my-secret") // before New(); overrides lan / lan_password in config.json
+node, err := ygg.New("")
+```
+
+- **Password.** With a password, only nodes with the same password peer with
+  each other; without one, the node peers with any Yggdrasil node in the
+  network. The password protects only these local links: the node is still
+  part of the whole Yggdrasil network through its internet peers.
+- **Offline start.** With LAN discovery on, `New()` returns even when no
+  internet peer comes up (after the usual start timeout), so nodes in a
+  network without internet still find each other.
+- **Peer selection** does not touch LAN links: they are never ranked, saved to
+  the config or removed, and do not count towards the health of the internet
+  connection. `Connected()` does count them.
+- **Interfaces** are the Yggdrasil platform defaults (macOS: `en*`, `bridge*`;
+  Linux: all).
+- **Mobile.** iOS needs the `com.apple.developer.networking.multicast`
+  entitlement; Android needs a `WifiManager.MulticastLock` held while the node
+  runs.
+
 ## Environment and Dependencies
 
 - **Language:** Go 1.27.3+
@@ -105,6 +135,7 @@ forged answer comes from nearby, such fake peers would look the fastest.
 | `New(cfgPath string)` | Initializes and starts a Yggdrasil node, returning `*Node`. |
 | `(*Node).Close()` | Gracefully stops the running node. |
 | `SetVerbose(v bool)` | Enables verbose logging. |
+| `SetLAN(enabled bool, password string)` | Turns LAN discovery on/off and sets its password (overrides the config). |
 | `SetMaxPeers(n int)` | How many best peers to keep (default 8, `n <= 0` keeps every reachable one). |
 | `StartAndConnect(cfg, peers, logger)` | Low-level: starts a core and returns once the first peer is up (no background selection). |
 | `(*Node).Connected()` | Reports whether at least one peer has completed the handshake. |

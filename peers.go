@@ -117,10 +117,11 @@ func isUp(p ycore.PeerInfo) bool {
 }
 
 // measured returns outbound peers that are up and have a measured RTT.
+// LAN links are left out: they are not managed by the peer manager.
 func measured(core peerCore) map[string]time.Duration {
 	out := map[string]time.Duration{}
 	for _, p := range core.GetPeers() {
-		if isUp(p) && !p.Inbound && p.Latency > 0 {
+		if isUp(p) && !p.Inbound && !isLANPeer(p.URI) && p.Latency > 0 {
 			out[p.URI] = p.Latency
 		}
 	}
@@ -137,10 +138,22 @@ func countUp(core peerCore) int {
 	return n
 }
 
+// countUpRemote counts up peers except LAN links: the health of the
+// connection to the wider network.
+func countUpRemote(core peerCore) int {
+	n := 0
+	for _, p := range core.GetPeers() {
+		if isUp(p) && !isLANPeer(p.URI) {
+			n++
+		}
+	}
+	return n
+}
+
 func countOutbound(core peerCore) int {
 	n := 0
 	for _, p := range core.GetPeers() {
-		if !p.Inbound {
+		if !p.Inbound && !isLANPeer(p.URI) {
 			n++
 		}
 	}
@@ -373,7 +386,7 @@ func applySelection(ctx context.Context, core peerCore, set *peerSet, selected [
 	}
 	removed := 0
 	for _, p := range core.GetPeers() {
-		if p.Inbound {
+		if p.Inbound || isLANPeer(p.URI) {
 			continue
 		}
 		if _, sel := want[p.URI]; !sel {
@@ -461,7 +474,7 @@ func (n *Node) runPeerManager(ctx context.Context, cfgPath string, lastFull time
 			return
 		case <-tick.C:
 		}
-		if countUp(core) < healthyPeers() {
+		if countUpRemote(core) < healthyPeers() {
 			weak++
 		} else {
 			weak = 0
