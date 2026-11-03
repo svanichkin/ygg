@@ -60,9 +60,15 @@ If none is found, a new configuration is generated.
 
 ## Environment and Dependencies
 
-- **Language:** Go 1.25.5+
+- **Language:** Go 1.27.3+
 - **Dependencies:**
-  - `github.com/yggdrasil-network/yggdrasil-go`
+  - `github.com/yggdrasil-network/yggdrasil-go` v0.5.15
+  - `gvisor.dev/gvisor` (in-process TCP/IP netstack, `go` branch)
+  - `github.com/quic-go/quic-go`
+
+> **Note on gVisor:** always update it with `go get gvisor.dev/gvisor@go`.
+> A plain `go get -u ./...` pulls the `master` branch, which does not build
+> with the Go toolchain (it requires Bazel-generated files).
 
 ## API Overview
 
