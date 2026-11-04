@@ -252,11 +252,6 @@ func New(cfgPath string) (*Node, error) {
 	return node, nil
 }
 
-func init() {
-	// Create the default data directory for examples.
-	_ = os.MkdirAll(filepath.Join(".", "data"), 0o755)
-}
-
 type AppConfig struct {
 	// Seed is the inline private key seed (empty => generate).
 	Seed string `json:"seed,omitempty"`
@@ -795,7 +790,7 @@ func (ns *Netstack) ListenTCP(port int) (net.Listener, error) {
 	}
 	logV("[p2p] [ns] listen tcp [%s]:%d", addr.String(), port)
 	fa := tcpip.FullAddress{NIC: nicID, Addr: addr, Port: uint16(port)}
-	ln, err := gonet.ListenTCP(st, fa, ipv6.ProtocolNumber)
+	ln, err := listenTCP(st, fa)
 	if err != nil {
 		return nil, err
 	}
@@ -840,23 +835,10 @@ func (ns *Netstack) DialTCP(peerIPv6 string, port int, timeout time.Duration) (n
 		defer cancel()
 	}
 
-	c, err := gonet.DialContextTCP(ctx, st, rfa, ipv6.ProtocolNumber)
+	// gVisor TCP has Nagle off by default, so no TCP_NODELAY is needed.
+	c, err := dialTCP(ctx, st, rfa)
 	if err != nil {
 		return nil, err
-	}
-	// Optional low-latency settings (if supported by gonet).
-	var ic interface{} = c
-	type noDelaySetter interface{ SetNoDelay(bool) error }
-	type kaSetter interface {
-		SetKeepAlive(bool) error
-		SetKeepAlivePeriod(time.Duration) error
-	}
-	if nd, ok := ic.(noDelaySetter); ok {
-		_ = nd.SetNoDelay(true)
-	}
-	if ka, ok := ic.(kaSetter); ok {
-		_ = ka.SetKeepAlive(true)
-		_ = ka.SetKeepAlivePeriod(30 * time.Second)
 	}
 	return c, nil
 }
@@ -955,12 +937,14 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	core := n.Core
 	// L3 R/W link to Ygg core.
 	rwc := ipv6rwc.NewReadWriteCloser(core)
-	// Channel endpoint with larger queue and MTU 1280.
-	const mtu = 1280
-	ep := channel.New(4096, uint32(mtu), "ygg-chan")
+	// Use the largest MTU the core supports (like the Yggdrasil TUN default):
+	// far fewer packets for bulk data.
+	rwc.SetMTU(rwc.MaxMTU())
+	mtu := uint32(rwc.MTU())
+	ep := channel.New(4096, mtu, "ygg-chan")
 	st := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv6.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocolCUBIC, udp.NewProtocol},
 	})
 	cleanup := true
 	defer func() {
@@ -1018,54 +1002,45 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 	ns := &Netstack{Stack: st, NICID: nicID, addr: yaddr, mtu: mtu, rwc: rwc, chEP: ep, stopCh: make(chan struct{})}
 	n.Net = ns
 	cleanup = false
-	// TX pump: packets from netstack -> ygg core.
+	// TX pump: packets from netstack -> ygg core. Blocks until a packet is
+	// queued or the netstack is closed.
+	txCtx, txCancel := context.WithCancel(context.Background())
+	go func() {
+		<-ns.stopCh
+		txCancel()
+	}()
 	go func() {
 		var txBytes uint64
-		defer logV("[netstack] tx stopped, bytes=%d", txBytes)
+		defer func() { logV("[netstack] tx stopped, bytes=%d", txBytes) }()
+		// One reused buffer: the core copies the packet (ipv6rwc and
+		// Core.WriteTo both copy), so nothing is allocated per packet.
+		buf := make([]byte, 0, mtu)
 		for {
-			select {
-			case <-ns.stopCh:
-				logV("[netstack] tx stopping")
-				return
-			default:
-			}
-			pkt := ep.Read()
+			pkt := ep.ReadContext(txCtx)
 			if pkt == nil {
-				// No outgoing packet currently; brief idle sleep.
-				time.Sleep(2 * time.Millisecond)
-				continue
+				return
 			}
-			view := pkt.ToView()
-			b := view.AsSlice()
+			buf = buf[:0]
+			for _, s := range pkt.AsSlices() {
+				buf = append(buf, s...)
+			}
 			pkt.DecRef()
-			if len(b) == 0 {
+			if len(buf) == 0 {
 				continue
 			}
-			off := 0
-			for off < len(b) {
-				n, err := rwc.Write(b[off:])
-				if err != nil {
-					if strings.Contains(err.Error(), "closed") || err == io.EOF {
-						log.Printf("[netstack] tx: write closed: %v", err)
-						return
-					}
-					logV("[netstack] tx write error (will retry): %v", err)
-					time.Sleep(5 * time.Millisecond)
-					continue
-				}
-				if n <= 0 {
-					time.Sleep(1 * time.Millisecond)
-					continue
-				}
-				off += n
-				txBytes += uint64(n)
+			// A packet is written whole or not at all. On error drop it, as
+			// any IP hop would: retrying would stall all traffic behind it.
+			if _, err := rwc.Write(buf); err != nil {
+				logV("[netstack] tx: drop packet: %v", err)
+				continue
 			}
+			txBytes += uint64(len(buf))
 		}
 	}()
 	// RX pump: frames from ygg core -> netstack.
 	go func() {
 		var rxBytes uint64
-		defer logV("[netstack] rx stopped, bytes=%d", rxBytes)
+		defer func() { logV("[netstack] rx stopped, bytes=%d", rxBytes) }()
 		buf := make([]byte, mtu)
 		for {
 			select {
@@ -1086,9 +1061,8 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 				continue
 			}
 			rxBytes += uint64(nread)
-			payload := make([]byte, nread)
-			copy(payload, buf[:nread])
-			pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(payload)})
+			// MakeWithData copies, so buf can be reused.
+			pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(buf[:nread])})
 			ep.InjectInbound(header.IPv6ProtocolNumber, pb)
 			pb.DecRef()
 		}

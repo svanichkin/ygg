@@ -118,6 +118,23 @@ node, err := ygg.New("")
   entitlement; Android needs a `WifiManager.MulticastLock` held while the node
   runs.
 
+## Netstack
+
+Traffic to other Yggdrasil nodes goes through an in-process gVisor TCP/IP
+stack (`ListenTCP`, `DialTCP`, `ListenUDP`, `DialUDP`), no OS TUN device.
+
+- **MTU** is the largest the core supports (65535, like the Yggdrasil TUN
+  default), and TCP uses CUBIC. Bulk TCP between two nodes on localhost:
+  ~25 MB/s with the old 1280 MTU, 200+ MB/s now; a small request/response
+  round trip: ~0.15 ms. Nodes before v0.5.6 used MTU 1280 and are not
+  compatible for UDP datagrams over ~1230 bytes.
+- **TCP keepalive** is on for dialed and accepted connections: an idle
+  connection to a node that vanished (no FIN/RST, e.g. a phone that lost the
+  network) is closed after ~60 s (30 s idle + 3 probes 10 s apart) instead of
+  hanging forever.
+
+Benchmarks: `go test -run x -bench Netstack`.
+
 ## Environment and Dependencies
 
 - **Language:** Go 1.27.3+
