@@ -209,21 +209,10 @@ func New(cfgPath string) (*Node, error) {
 		logV("lan: discovery on (password set: %t)", password != "")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
-	defer cancel()
-
-	// Saved peers first: after the first run these are the best verified ones.
 	logV("peers: saved=%d", len(ac.Peers))
-	err = connectFirst(ctx, core, &node.peers, ac.Peers)
-	if err != nil {
-		// Saved peers are gone or the config is empty: try the public list.
-		logV("peers: saved peers failed (%v), fetching %s", err, publicPeersURL)
-		if fresh := fetchCandidates(5 * time.Second); len(fresh) == 0 {
-			err = fmt.Errorf("%w (public peer list unavailable)", err)
-		} else {
-			err = connectFirst(ctx, core, &node.peers, fresh)
-		}
-	}
+	err = connectStart(core, &node.peers, ac.Peers, func() []string {
+		return fetchCandidates(5 * time.Second)
+	})
 	switch {
 	case err == nil:
 		logV("connect: first peer up in %s", time.Since(t0).Truncate(time.Millisecond))

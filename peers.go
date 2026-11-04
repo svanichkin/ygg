@@ -41,7 +41,8 @@ var (
 	pollInterval   = 500 * time.Millisecond
 
 	startBatchWait = 10 * time.Second // per batch while waiting for the first peer
-	startTimeout   = 60 * time.Second // whole cold start
+	savedPeersWait = 15 * time.Second // saved peers at start, before the public list
+	startTimeout   = 60 * time.Second // public list at start (and StartAndConnect)
 
 	pruneDelay       = 20 * time.Second // after start: drop start-up links that lost
 	reselectInterval = 6 * time.Hour    // full re-check of all candidates
@@ -235,6 +236,31 @@ func connectFirst(ctx context.Context, core peerCore, set *peerSet, peers []stri
 		return ctx.Err()
 	}
 	return fmt.Errorf("no peer completed the handshake")
+}
+
+// connectStart connects a starting node: saved peers first (after the first
+// run these are the best verified ones), then, if none is up within
+// savedPeersWait, the public list from fetch. Each phase has its own time
+// budget, so slow saved peers cannot use up the public list's time. The saved
+// peers stay configured and keep trying during the second phase.
+func connectStart(core peerCore, set *peerSet, saved []string, fetch func() []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), savedPeersWait)
+	err := connectFirst(ctx, core, set, saved)
+	cancel()
+	if err == nil {
+		return nil
+	}
+	logV("peers: saved peers failed (%v), fetching %s", err, publicPeersURL)
+	fresh := fetch()
+	if len(fresh) == 0 {
+		return fmt.Errorf("saved peers: %w (public peer list unavailable)", err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), startTimeout)
+	defer cancel()
+	if err := connectFirst(ctx, core, set, fresh); err != nil {
+		return fmt.Errorf("public peers: %w", err)
+	}
+	return nil
 }
 
 // waitFor polls cond until it is true, d elapses or ctx is done.

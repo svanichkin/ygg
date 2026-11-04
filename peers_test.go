@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,12 +86,14 @@ func (f *fakeCore) configured() []string {
 
 func shortTimings(t *testing.T) {
 	t.Helper()
-	old := []time.Duration{probeSettle, pollInterval, startBatchWait, startTimeout, applyWait}
+	old := []time.Duration{probeSettle, pollInterval, startBatchWait, startTimeout, applyWait, savedPeersWait}
 	oldBatch := probeBatchSize
 	probeSettle, pollInterval, startBatchWait, startTimeout, applyWait = 300*time.Millisecond, 10*time.Millisecond, 200*time.Millisecond, 300*time.Millisecond, 200*time.Millisecond
+	savedPeersWait = 300 * time.Millisecond
 	probeBatchSize = 2
 	t.Cleanup(func() {
 		probeSettle, pollInterval, startBatchWait, startTimeout, applyWait = old[0], old[1], old[2], old[3], old[4]
+		savedPeersWait = old[5]
 		probeBatchSize = oldBatch
 	})
 }
@@ -274,5 +277,48 @@ func TestProbePeersRealHandshake(t *testing.T) {
 	}
 	if len(got) != 1 || got[alive] <= 0 {
 		t.Fatalf("probePeers = %v, want only %s with RTT", got, alive)
+	}
+}
+
+// Saved peers that hang (forged SYN-ACK) must not use up the time of the
+// public list: the public phase has its own budget.
+func TestConnectStartFallsBackToPublicList(t *testing.T) {
+	shortTimings(t)
+	f := newFakeCore(map[string]time.Duration{"tcp://public:1": 10 * time.Millisecond})
+	fetched := false
+	err := connectStart(f, &peerSet{}, []string{"tcp://saved-hangs:1"}, func() []string {
+		fetched = true
+		return []string{"tcp://public:1"}
+	})
+	if err != nil {
+		t.Fatalf("connectStart: %v", err)
+	}
+	if !fetched {
+		t.Fatal("public list was not fetched")
+	}
+	// The saved peer stays configured and keeps trying.
+	if got, want := f.configured(), []string{"tcp://public:1", "tcp://saved-hangs:1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("configured = %v, want %v", got, want)
+	}
+}
+
+func TestConnectStartSavedPeerSkipsPublicList(t *testing.T) {
+	shortTimings(t)
+	f := newFakeCore(map[string]time.Duration{"tcp://saved:1": 10 * time.Millisecond})
+	err := connectStart(f, &peerSet{}, []string{"tcp://saved:1"}, func() []string {
+		t.Fatal("public list fetched although a saved peer is up")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("connectStart: %v", err)
+	}
+}
+
+func TestConnectStartNoPublicList(t *testing.T) {
+	shortTimings(t)
+	f := newFakeCore(nil)
+	err := connectStart(f, &peerSet{}, []string{"tcp://saved-hangs:1"}, func() []string { return nil })
+	if err == nil || !strings.Contains(err.Error(), "public peer list unavailable") {
+		t.Fatalf("connectStart = %v, want public list error", err)
 	}
 }

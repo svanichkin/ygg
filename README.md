@@ -75,8 +75,9 @@ can answer with a forged SYN-ACK, so dead ports look open — and, since the
 forged answer comes from nearby, such fake peers would look the fastest.
 
 1. **Start.** Saved peers are added to the core; `New()` returns as soon as one
-   completes the handshake (usually well under a second). If none does, the
-   public list (`publicpeers.neilalexander.dev`) is tried in batches of 60.
+   completes the handshake (usually well under a second). If none does within
+   15 s, the public list (`publicpeers.neilalexander.dev`) is tried in batches
+   of 60, with its own 60 s budget; the saved peers keep trying meanwhile.
 2. **Prune.** After a cold start, 20 s later the node keeps the best of the
    peers it has measured and drops the rest.
 3. **Re-check.** In the background, all candidates (saved + public list) are
@@ -106,7 +107,7 @@ node, err := ygg.New("")
   network. The password protects only these local links: the node is still
   part of the whole Yggdrasil network through its internet peers.
 - **Offline start.** With LAN discovery on, `New()` returns even when no
-  internet peer comes up (after the usual start timeout), so nodes in a
+  internet peer comes up (offline: after ~15–20 s of trying), so nodes in a
   network without internet still find each other.
 - **Peer selection** does not touch LAN links: they are never ranked, saved to
   the config or removed, and do not count towards the health of the internet
