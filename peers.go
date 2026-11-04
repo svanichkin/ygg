@@ -36,12 +36,12 @@ var (
 	slowPeerFactor  = 4                      // drop peers slower than best*factor...
 	slowPeerFloor   = 100 * time.Millisecond // ...but never cut below this RTT
 
-	probeBatchSize = 60               // candidates checked at once
-	probeSettle    = 20 * time.Second // max wait per batch
-	pollInterval   = 500 * time.Millisecond
+	probeBatchSize = 60                    // candidates checked at once
+	probeSettle    = 20 * time.Second      // max wait per batch
+	pollInterval   = 20 * time.Millisecond // link state polling; also the start latency granularity
 
 	startBatchWait = 10 * time.Second // per batch while waiting for the first peer
-	savedPeersWait = 15 * time.Second // saved peers at start, before the public list
+	savedPeersWait = 5 * time.Second  // saved peers at start, before the public list
 	startTimeout   = 60 * time.Second // public list at start (and StartAndConnect)
 
 	pruneDelay       = 20 * time.Second // after start: drop start-up links that lost
