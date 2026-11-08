@@ -76,8 +76,21 @@ func startLAN(core *ycore.Core, cfg *ycfg.NodeConfig, password string, logger yc
 			Password: password,
 		})
 	}
-	return ymc.New(core, logger, opts...)
+	mc, err := ymc.New(core, logger, opts...)
+	if err != nil {
+		return nil, &lanUnavailableError{err}
+	}
+	return mc, nil
 }
+
+// lanUnavailableError: discovery could not open its socket, typically
+// because another program on this machine holds the port (Plan 9 cannot
+// share it). The node works without LAN discovery; a configuration error,
+// by contrast, is returned as is.
+type lanUnavailableError struct{ err error }
+
+func (e *lanUnavailableError) Error() string { return e.err.Error() }
+func (e *lanUnavailableError) Unwrap() error { return e.err }
 
 // isLANPeer reports whether the peer URI points at a link-local address,
 // i.e. the link was made by LAN discovery. Such links are not managed by the

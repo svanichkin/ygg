@@ -201,12 +201,17 @@ func New(cfgPath string) (*Node, error) {
 	// same network can be the first peer.
 	if on, password := lanSettings(ac); on {
 		mc, err := startLAN(core, yc, password, quietLogger{})
-		if err != nil {
+		var unavailable *lanUnavailableError
+		switch {
+		case errors.As(err, &unavailable):
+			logV("lan: discovery off: %v", err)
+		case err != nil:
 			_ = node.Close()
 			return nil, fmt.Errorf("start lan discovery: %w", err)
+		default:
+			node.lan = mc
+			logV("lan: discovery on (password set: %t)", password != "")
 		}
-		node.lan = mc
-		logV("lan: discovery on (password set: %t)", password != "")
 	}
 
 	logV("peers: saved=%d", len(ac.Peers))
