@@ -45,6 +45,11 @@ var (
 	startTimeout   = 60 * time.Second // public list at start (and StartAndConnect)
 
 	pruneDelay       = 20 * time.Second // after start: drop start-up links that lost
+	savedRanked      = 16               // best peers saved to the config: the selection and its backups
+	failoverPoll     = time.Second      // how often the link to the network is checked
+	failoverGrace    = 3 * time.Second  // no remote peer up this long: switch to backups
+	failoverBatch    = 4                // backups tried at once
+	failoverWait     = 5 * time.Second  // per batch, for a backup to come up and be measured
 	reselectInterval = 6 * time.Hour    // full re-check of all candidates
 	reselectMinGap   = 5 * time.Minute  // never re-check more often than this
 	healthInterval   = time.Minute
@@ -345,6 +350,39 @@ func batchSettled(core peerCore, keys []string) bool {
 	return true
 }
 
+// rankAll orders measured peers by RTT, at most maxPeersPerHost per host,
+// without dropping slow ones: the backups of a selection, best first.
+func rankAll(results map[string]time.Duration, limit int) []string {
+	type entry struct {
+		uri string
+		rtt time.Duration
+	}
+	list := make([]entry, 0, len(results))
+	for uri, rtt := range results {
+		list = append(list, entry{uri, rtt})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].rtt != list[j].rtt {
+			return list[i].rtt < list[j].rtt
+		}
+		return list[i].uri < list[j].uri
+	})
+	var out []string
+	perHost := map[string]int{}
+	for _, e := range list {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		h := peerHost(e.uri)
+		if perHost[h] >= maxPeersPerHost {
+			continue
+		}
+		perHost[h]++
+		out = append(out, e.uri)
+	}
+	return out
+}
+
 // rankPeers orders measured peers by RTT, keeps at most maxPeersPerHost per
 // host, drops peers far slower than the best (keeping at least minKeepPeers)
 // and returns at most limit peers (limit <= 0: no limit).
@@ -469,35 +507,64 @@ func (n *Node) runPeerManager(ctx context.Context, cfgPath string, lastFull time
 	if sleepContext(ctx, pruneDelay) != nil {
 		return
 	}
+	// Every peer measured at start is a backup for later (see failover).
+	var backups []string
+	if live := n.liveRTTs(core); len(live) > 0 {
+		backups = rankAll(live, savedRanked)
+	}
 	if limit := configuredMaxPeers(); limit > 0 && countOutbound(core) > limit {
 		if sel := n.rankLive(core); len(sel) > 0 {
 			if err := applySelection(ctx, core, &n.peers, sel); err != nil {
 				logV("peers: prune: %v", err)
-			} else if err := savePeers(cfgPath, sel, false); err != nil {
+			} else if err := savePeers(cfgPath, uniqPeers(sel, backups), false); err != nil {
 				logV("peers: save: %v", err)
 			}
 		}
 	}
 
-	// 2. Full re-check now if the last one is old, then on schedule/health.
-	var lastTry time.Time
+	// 2. Full re-check now if the last one is old, then on schedule/health;
+	// a lost link to the network switches to the backups within seconds.
+	var lastTry, downSince time.Time
 	weak := 0
 	tick := time.NewTicker(healthInterval)
 	defer tick.Stop()
+	fast := time.NewTicker(failoverPoll)
+	defer fast.Stop()
 	for {
 		due := time.Since(lastFull) >= reselectInterval || weak >= 2
 		if due && time.Since(lastTry) >= reselectMinGap {
 			lastTry = time.Now()
 			weak = 0
-			if err := n.reselect(ctx, core, cfgPath); err != nil {
+			if ranked, err := n.reselect(ctx, core, cfgPath); err != nil {
 				logV("peers: re-check: %v", err)
 			} else {
 				lastFull = time.Now()
+				backups = ranked
 			}
 		}
 		select {
 		case <-ctx.Done():
 			return
+		case <-fast.C:
+			if countUpRemote(core) > 0 {
+				downSince = time.Time{}
+				continue
+			}
+			if downSince.IsZero() {
+				downSince = time.Now()
+				continue
+			}
+			if time.Since(downSince) < failoverGrace {
+				continue
+			}
+			downSince = time.Time{}
+			if ranked, ok := n.failover(ctx, core, cfgPath, backups); ok {
+				backups = ranked
+			} else {
+				weak = 2 // no backup answered: a full re-check
+				lastTry = time.Time{}
+			}
+			continue
 		case <-tick.C:
 		}
 		if countUpRemote(core) < healthyPeers() {
@@ -515,37 +582,86 @@ func healthyPeers() int {
 	return 2
 }
 
-func (n *Node) rankLive(core peerCore) []string {
+// liveRTTs returns the measured RTT of the core's outbound peers by full URI.
+func (n *Node) liveRTTs(core peerCore) map[string]time.Duration {
 	live := map[string]time.Duration{}
 	for key, rtt := range measured(core) {
 		live[n.peers.lookup(key)] = rtt
 	}
-	return rankPeers(live, configuredMaxPeers())
+	return live
 }
 
-func (n *Node) reselect(ctx context.Context, core peerCore, cfgPath string) error {
+func (n *Node) rankLive(core peerCore) []string {
+	return rankPeers(n.liveRTTs(core), configuredMaxPeers())
+}
+
+// reselect re-checks all candidates on a probe core, applies the best and
+// returns the ranking (the backups).
+func (n *Node) reselect(ctx context.Context, core peerCore, cfgPath string) ([]string, error) {
 	saved, err := LoadOrInitAppConfig(cfgPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	candidates := uniqPeers(saved.Peers, fetchCandidates(10*time.Second))
 	if len(candidates) == 0 {
-		return fmt.Errorf("no candidates")
+		return nil, fmt.Errorf("no candidates")
 	}
 	logV("peers: re-check of %d candidates", len(candidates))
 	results, err := probePeers(ctx, candidates)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sel := rankPeers(results, configuredMaxPeers())
 	if len(sel) == 0 {
-		return fmt.Errorf("no candidate completed the handshake")
+		return nil, fmt.Errorf("no candidate completed the handshake")
 	}
 	for _, p := range sel {
 		logV("peers: selected %8s %s", results[p].Round(time.Millisecond/10), p)
 	}
 	if err := applySelection(ctx, core, &n.peers, sel); err != nil {
-		return err
+		return nil, err
 	}
-	return savePeers(cfgPath, sel, true)
+	ranked := rankAll(results, savedRanked)
+	return ranked, savePeers(cfgPath, uniqPeers(sel, ranked), true)
+}
+
+// failover replaces peers that all went down with the best backups that
+// answer: batches of failoverBatch in ranking order, each given failoverWait
+// to come up and be measured. The fastest that came up is kept, the rest is
+// removed. It returns the backups that remain and whether one came up.
+func (n *Node) failover(ctx context.Context, core peerCore, cfgPath string, backups []string) ([]string, bool) {
+	current := map[string]bool{}
+	for _, p := range core.GetPeers() {
+		current[p.URI] = true
+	}
+	var rest []string
+	for _, b := range backups {
+		if !current[linkKey(b)] {
+			rest = append(rest, b)
+		}
+	}
+	logV("peers: no remote peer up, trying %d backups", len(rest))
+	for start := 0; start < len(rest); start += failoverBatch {
+		batch := rest[start:min(start+failoverBatch, len(rest))]
+		addPeers(core, &n.peers, batch)
+		core.RetryPeersNow()
+		if !waitFor(ctx, failoverWait, func() bool { return len(measured(core)) > 0 }) {
+			continue
+		}
+		sel := n.rankLive(core)
+		if err := applySelection(ctx, core, &n.peers, sel); err != nil {
+			logV("peers: failover: %v", err)
+			return rest, false
+		}
+		for _, p := range sel {
+			logV("peers: failover to %s", p)
+		}
+		left := rest[min(start+failoverBatch, len(rest)):]
+		ranked := uniqPeers(sel, left)
+		if err := savePeers(cfgPath, ranked, false); err != nil {
+			logV("peers: save: %v", err)
+		}
+		return ranked, true
+	}
+	return rest, false
 }

@@ -62,7 +62,7 @@ If none is found, a new configuration is generated.
 | Field | Meaning |
 |-------|---------|
 | `seed` | Private key seed (base64url). Generated on first run. |
-| `peers` | Peer list. A new config starts with a built-in list; after the first check it holds only the best verified peers, ordered by RTT. |
+| `peers` | Peer list. A new config starts with a built-in list; after the first check it holds the best verified peers, ordered by RTT: the selected ones first, then backups (at most 16 in all). |
 | `peers_checked_at` | When all candidates were last re-checked. |
 | `lan` | `true` turns on peer discovery in the local network (off by default). |
 | `lan_password` | Only nodes with the same password peer in the local network. Empty: any Yggdrasil node. At most 64 bytes. |
@@ -90,6 +90,13 @@ forged answer comes from nearby, such fake peers would look the fastest.
 
    Old peers are removed only after a selected one is up. The re-check runs
    every 6 hours, and earlier if fewer than 2 peers stay up.
+4. **Failover.** Every peer measured at start or in a re-check is ranked by RTT
+   and kept as a backup (and saved, so the next start has them too). When no
+   remote peer has been up for 3 s, the next backups are added 4 at a time;
+   the fastest that completes the handshake within 5 s is kept and the rest
+   removed. Only if no backup answers is a full re-check started. With
+   `SetMaxPeers(1)` the node has a single link, so it is a leaf of the network
+   (no one's traffic is routed through it), and losing that link costs seconds.
 
 ## LAN Discovery
 

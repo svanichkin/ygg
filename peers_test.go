@@ -322,3 +322,85 @@ func TestConnectStartNoPublicList(t *testing.T) {
 		t.Fatalf("connectStart = %v, want public list error", err)
 	}
 }
+
+func withMaxPeers(t *testing.T, n int) {
+	t.Helper()
+	stateMu.Lock()
+	old, oldSet := maxPeers, maxPeersSet
+	maxPeers, maxPeersSet = n, true
+	stateMu.Unlock()
+	t.Cleanup(func() {
+		stateMu.Lock()
+		maxPeers, maxPeersSet = old, oldSet
+		stateMu.Unlock()
+	})
+}
+
+// With one peer, losing it switches to the fastest backup that answers;
+// dead, hanging and slower backups and the lost peer are removed.
+func TestFailoverSwitchesToTheBestBackup(t *testing.T) {
+	shortTimings(t)
+	withMaxPeers(t, 1)
+	oldWait := failoverWait
+	failoverWait = 300 * time.Millisecond
+	t.Cleanup(func() { failoverWait = oldWait })
+
+	core := newFakeCore(map[string]time.Duration{
+		"tls://a:1": 20 * time.Millisecond,
+		"tls://b:1": 80 * time.Millisecond,
+		"tls://c:1": 30 * time.Millisecond,
+	}, "tls://d:1")
+	n := &Node{}
+	addPeers(core, &n.peers, []string{"tls://a:1"})
+	// The peer dies.
+	core.mu.Lock()
+	delete(core.rtt, "tls://a:1")
+	core.fail["tls://a:1"] = true
+	core.mu.Unlock()
+
+	cfg := filepath.Join(t.TempDir(), "ygg.json")
+	backups := []string{"tls://a:1", "tls://d:1", "tls://e:1", "tls://b:1", "tls://c:1"}
+	ranked, ok := n.failover(context.Background(), core, cfg, backups)
+	if !ok {
+		t.Fatal("no backup taken")
+	}
+	if got := core.configured(); !reflect.DeepEqual(got, []string{"tls://c:1"}) {
+		t.Fatalf("peers after failover %v, want the fastest backup only", got)
+	}
+	if len(ranked) == 0 || ranked[0] != "tls://c:1" {
+		t.Fatalf("ranking after failover %v, want c first", ranked)
+	}
+	saved, err := LoadOrInitAppConfig(cfg)
+	if err != nil || len(saved.Peers) == 0 || saved.Peers[0] != "tls://c:1" {
+		t.Fatalf("saved peers %v (%v), want c first", saved.Peers, err)
+	}
+}
+
+func TestFailoverWithoutLiveBackups(t *testing.T) {
+	shortTimings(t)
+	withMaxPeers(t, 1)
+	oldWait := failoverWait
+	failoverWait = 100 * time.Millisecond
+	t.Cleanup(func() { failoverWait = oldWait })
+
+	core := newFakeCore(map[string]time.Duration{}, "tls://a:1", "tls://d:1")
+	n := &Node{}
+	addPeers(core, &n.peers, []string{"tls://a:1"})
+	_, ok := n.failover(context.Background(), core, filepath.Join(t.TempDir(), "ygg.json"), []string{"tls://d:1", "tls://e:1"})
+	if ok {
+		t.Fatal("failover reported success without a live backup")
+	}
+}
+
+func TestRankAllKeepsSlowPeersAsBackups(t *testing.T) {
+	got := rankAll(map[string]time.Duration{
+		"tls://a:1":  10 * time.Millisecond,
+		"tls://a:2":  12 * time.Millisecond, // same host
+		"tls://b:1":  900 * time.Millisecond,
+		"quic://c:1": 40 * time.Millisecond,
+	}, 0)
+	want := []string{"tls://a:1", "quic://c:1", "tls://b:1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rankAll %v, want %v", got, want)
+	}
+}
