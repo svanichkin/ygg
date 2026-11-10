@@ -236,6 +236,14 @@ func New(cfgPath string) (*Node, error) {
 		return nil, fmt.Errorf("start netstack: %w", err)
 	}
 
+	if directSetting() {
+		if err := node.startDirectService(); err != nil {
+			logV("direct: service off: %v", err)
+		} else {
+			logV("direct: on")
+		}
+	}
+
 	addr := node.Core.Address()
 	keyHex := strings.TrimSpace(ac.Seed)
 	if len(keyHex) >= 8 {
@@ -669,6 +677,7 @@ type Node struct {
 	peerCancel context.CancelFunc // stops the background peer manager
 	peers      peerSet            // full URIs of peers added to Core
 	lan        *ymc.Multicast     // LAN discovery, nil when off
+	direct     *directService     // answers direct-link requests, nil when off
 }
 
 // Netstack wraps an in-process gVisor TCP/IP stack bridged to the Yggdrasil core via ipv6rwc.
@@ -1149,6 +1158,8 @@ func (n *Node) Close() error {
 	n.Core = nil
 	lan := n.lan
 	n.lan = nil
+	direct := n.direct
+	n.direct = nil
 	n.mu.Unlock()
 
 	if cancel != nil {
@@ -1158,6 +1169,9 @@ func (n *Node) Close() error {
 		peerCancel()
 	}
 
+	if direct != nil {
+		direct.close()
+	}
 	if netstack != nil {
 		_ = netstack.Close()
 	}

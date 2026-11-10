@@ -3,6 +3,7 @@ module github.com/svanichkin/ygg
 go 1.27.3
 
 require (
+	github.com/quic-go/quic-go v0.65.0
 	github.com/yggdrasil-network/yggdrasil-go v0.5.15
 	gvisor.dev/gvisor v0.0.0-20261103192924-1ff810cb4f8e
 )
@@ -17,7 +18,6 @@ require (
 	github.com/gologme/log v1.3.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/hjson/hjson-go/v4 v4.7.1 // indirect
-	github.com/quic-go/quic-go v0.65.0 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect

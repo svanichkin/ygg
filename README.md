@@ -11,6 +11,7 @@ Ygg is a lightweight Go library that embeds a self-contained Yggdrasil node — 
 - 🪶 **Library-friendly API** — import and start with a single call.
 - 🔔 **Connectivity events** — receive callbacks when the node connects or disconnects.
 - 🏠 **LAN discovery** — nodes in one local network find each other and peer directly, optionally only with a shared password.
+- 🕳️ **Direct links** — two nodes in a session connect straight through their NATs (UDP hole punching) instead of through public peers.
 
 ## Installation
 
@@ -125,6 +126,46 @@ node, err := ygg.New("")
   entitlement; Android needs a `WifiManager.MulticastLock` held while the node
   runs.
 
+## Direct Links
+
+Two nodes usually reach each other through public peers, often far away and
+loaded: hundreds of milliseconds of latency, at worst seconds. A direct link
+connects them as Yggdrasil peers straight over the internet, through their
+NATs; routing then prefers it by itself, since the destination is one hop
+away.
+
+```go
+ygg.SetDirect(true) // before New(); both nodes need it
+node, err := ygg.New("")
+// ... once a session with the peer is going:
+stop := ygg.StartDirect(peerIPv6) // returns at once, works in the background
+defer stop()                      // the link lasts until stop
+```
+
+- **How.** Each side opens a UDP socket and learns its public address from
+  STUN servers. The two exchange their candidates (public and local addresses
+  of the socket), keys and a token over Yggdrasil (TCP, port 7701). The
+  responder sends packets to the initiator's candidates, which opens its NAT;
+  the initiator dials QUIC to all of the responder's candidates and keeps the
+  first that connects. Yggdrasil links then run over QUIC streams: the
+  initiator peers with a local relay pinned to the peer's key, the responder
+  joins streams that carry the token to a local Yggdrasil listener.
+- **Quality.** Routing prefers a direct link whatever its quality, so the
+  initiator measures the Yggdrasil route's RTT before the link comes up and
+  then watches the link's QUIC statistics. A link worse than the route for 5 s
+  in a row (over 5% loss, or a longer round trip) is closed: traffic goes back
+  to the Yggdrasil route at once, and the link is tried again in 2 minutes.
+- **Privacy.** Off by default: a direct link shows each side the other's
+  public IP address, which Yggdrasil otherwise hides, and asks public STUN
+  servers for one's own.
+- **When it fails.** If both NATs map every destination to a different port,
+  or a firewall blocks UDP, no candidate connects and the session stays on its
+  Yggdrasil route. A failed attempt is repeated twice, 30 s apart; a peer that
+  has direct links off or is already a peer is not asked again. A link that
+  breaks is set up again.
+- **Peer selection** does not touch direct links, as with LAN links.
+- **Logs.** Progress is logged with the `[ygg/direct]` prefix.
+
 ## Netstack
 
 Traffic to other Yggdrasil nodes goes through an in-process gVisor TCP/IP
@@ -161,6 +202,8 @@ Benchmarks: `go test -run x -bench Netstack`.
 | `(*Node).Close()` | Gracefully stops the running node. |
 | `SetVerbose(v bool)` | Enables verbose logging. |
 | `SetLAN(enabled bool, password string)` | Turns LAN discovery on/off and sets its password (overrides the config). |
+| `SetDirect(enabled bool)` | Turns direct links on/off (default off): answering other nodes and `StartDirect`. |
+| `StartDirect(peerIPv6 string) (stop func())` | Sets up a direct link to the peer and keeps it until `stop`. |
 | `SetMaxPeers(n int)` | How many best peers to keep (default 8, `n <= 0` keeps every reachable one). |
 | `StartAndConnect(cfg, peers, logger)` | Low-level: starts a core and returns once the first peer is up (no background selection). |
 | `(*Node).Connected()` | Reports whether at least one peer has completed the handshake. |

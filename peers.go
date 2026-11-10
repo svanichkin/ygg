@@ -123,11 +123,12 @@ func isUp(p ycore.PeerInfo) bool {
 }
 
 // measured returns outbound peers that are up and have a measured RTT.
-// LAN links are left out: they are not managed by the peer manager.
+// LAN and direct links are left out: they are not managed by the peer
+// manager.
 func measured(core peerCore) map[string]time.Duration {
 	out := map[string]time.Duration{}
 	for _, p := range core.GetPeers() {
-		if isUp(p) && !p.Inbound && !isLANPeer(p.URI) && p.Latency > 0 {
+		if isUp(p) && !p.Inbound && !isUnmanaged(p.URI) && p.Latency > 0 {
 			out[p.URI] = p.Latency
 		}
 	}
@@ -144,12 +145,12 @@ func countUp(core peerCore) int {
 	return n
 }
 
-// countUpRemote counts up peers except LAN links: the health of the
+// countUpRemote counts up peers except LAN and direct links: the health of the
 // connection to the wider network.
 func countUpRemote(core peerCore) int {
 	n := 0
 	for _, p := range core.GetPeers() {
-		if isUp(p) && !isLANPeer(p.URI) {
+		if isUp(p) && !isUnmanaged(p.URI) {
 			n++
 		}
 	}
@@ -159,7 +160,7 @@ func countUpRemote(core peerCore) int {
 func countOutbound(core peerCore) int {
 	n := 0
 	for _, p := range core.GetPeers() {
-		if !p.Inbound && !isLANPeer(p.URI) {
+		if !p.Inbound && !isUnmanaged(p.URI) {
 			n++
 		}
 	}
@@ -450,7 +451,7 @@ func applySelection(ctx context.Context, core peerCore, set *peerSet, selected [
 	}
 	removed := 0
 	for _, p := range core.GetPeers() {
-		if p.Inbound || isLANPeer(p.URI) {
+		if p.Inbound || isUnmanaged(p.URI) {
 			continue
 		}
 		if _, sel := want[p.URI]; !sel {
