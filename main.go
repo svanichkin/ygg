@@ -930,7 +930,32 @@ func (n *Node) DialTCP(peerIPv6 string, port int) (net.Conn, error) {
 	if ns == nil {
 		return nil, fmt.Errorf("netstack not started")
 	}
-	return ns.DialTCP(peerIPv6, port, 10*time.Second)
+	return ns.dialRetrying(peerIPv6, port, dialTimeout)
+}
+
+const (
+	// dialTimeout bounds DialTCP; dialAttempt bounds each of its attempts.
+	dialTimeout = 10 * time.Second
+	dialAttempt = 2 * time.Second
+)
+
+// dialRetrying dials in short attempts until timeout. While a route to a
+// node is being looked up its first packets are lost, and TCP resends a SYN
+// after ever longer pauses (1, 2, 4 s): a fresh connection gets through as
+// soon as the route is known, a waiting one only at its next resend. A dial
+// that is refused returns at once.
+func (ns *Netstack) dialRetrying(peerIPv6 string, port int, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		attempt := min(dialAttempt, time.Until(deadline))
+		c, err := ns.DialTCP(peerIPv6, port, attempt)
+		if err == nil || time.Now().After(deadline) || attempt <= 0 {
+			return c, err
+		}
+		if !errors.Is(err, context.DeadlineExceeded) && !isTimeout(err) {
+			return nil, err
+		}
+	}
 }
 
 // StartNetstack wires the Yggdrasil core to the gVisor netstack via an ipv6rwc/channel endpoint.

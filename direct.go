@@ -597,16 +597,10 @@ func (n *Node) dialDirectService(ctx context.Context, peer string) (net.Conn, er
 	if ns == nil {
 		return nil, net.ErrClosed
 	}
-	deadline := time.Now().Add(directControlWait)
-	for {
-		c, err := ns.DialTCP(peer, directPort, 2*time.Second)
-		if err == nil || ctx.Err() != nil || time.Now().After(deadline) {
-			return c, err
-		}
-		if !errors.Is(err, context.DeadlineExceeded) && !isTimeout(err) {
-			return nil, err // refused: no direct service there
-		}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
+	return ns.dialRetrying(peer, directPort, directControlWait)
 }
 
 func isTimeout(err error) bool {
