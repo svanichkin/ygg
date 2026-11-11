@@ -1074,6 +1074,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 				continue
 			}
 			txBytes += uint64(len(buf))
+			noteTraffic()
 		}
 	}()
 	// RX pump: frames from ygg core -> netstack.
@@ -1100,6 +1101,7 @@ func (n *Node) StartNetstack() (*Netstack, error) {
 				continue
 			}
 			rxBytes += uint64(nread)
+			noteTraffic()
 			// MakeWithData copies, so buf can be reused.
 			pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(buf[:nread])})
 			ep.InjectInbound(header.IPv6ProtocolNumber, pb)

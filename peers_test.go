@@ -404,3 +404,36 @@ func TestRankAllKeepsSlowPeersAsBackups(t *testing.T) {
 		t.Fatalf("rankAll %v, want %v", got, want)
 	}
 }
+
+// While the node carries its own traffic, changes to the peers wait: they
+// would move the node in the tree and break the routes in use.
+func TestWaitQuietHoldsWhileTraffic(t *testing.T) {
+	oldQuiet, oldPoll := quietFor, quietPoll
+	quietFor, quietPoll = 150*time.Millisecond, 10*time.Millisecond
+	defer func() { quietFor, quietPoll = oldQuiet, oldPoll; lastTraffic.Store(0) }()
+
+	lastTraffic.Store(0)
+	if busy() {
+		t.Fatal("busy without any traffic")
+	}
+	start := time.Now()
+	stop := time.After(300 * time.Millisecond)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				noteTraffic()
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	}()
+	time.Sleep(30 * time.Millisecond)
+	if err := waitQuiet(context.Background(), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited < 300*time.Millisecond+quietFor-50*time.Millisecond {
+		t.Fatalf("went ahead after %v, while the traffic lasted 300ms (+%v quiet)", waited, quietFor)
+	}
+}

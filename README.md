@@ -98,6 +98,11 @@ forged answer comes from nearby, such fake peers would look the fastest.
    removed. Only if no backup answers is a full re-check started. With
    `SetMaxPeers(1)` the node has a single link, so it is a leaf of the network
    (no one's traffic is routed through it), and losing that link costs seconds.
+5. **Quiet first.** Changing the peers moves the node in the tree, and the
+   routes of the node's own traffic break for a second or two. So the prune
+   and the re-check wait until the node has carried none of its own traffic
+   (through its netstack) for 15 s: a call is not cut by them. A failover is
+   not held back: with no peer up there is no route anyway.
 
 ## LAN Discovery
 

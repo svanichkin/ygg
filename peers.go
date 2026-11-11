@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ycore "github.com/yggdrasil-network/yggdrasil-go/src/core"
@@ -508,6 +509,9 @@ func (n *Node) runPeerManager(ctx context.Context, cfgPath string, lastFull time
 	if sleepContext(ctx, pruneDelay) != nil {
 		return
 	}
+	if waitQuiet(ctx, "drop of start-up links") != nil {
+		return
+	}
 	// Every peer measured at start is a backup for later (see failover).
 	var backups []string
 	if live := n.liveRTTs(core); len(live) > 0 {
@@ -527,13 +531,24 @@ func (n *Node) runPeerManager(ctx context.Context, cfgPath string, lastFull time
 	// a lost link to the network switches to the backups within seconds.
 	var lastTry, downSince time.Time
 	weak := 0
+	postponed := false
 	tick := time.NewTicker(healthInterval)
 	defer tick.Stop()
 	fast := time.NewTicker(failoverPoll)
 	defer fast.Stop()
 	for {
 		due := time.Since(lastFull) >= reselectInterval || weak >= 2
-		if due && time.Since(lastTry) >= reselectMinGap {
+		if due && time.Since(lastTry) >= reselectMinGap && busy() {
+			// A re-check changes the peers, and with them where the node
+			// sits in the tree: the routes of the traffic going on now
+			// would break for a second or two. Later, when it is quiet
+			// (a lost link to the network still fails over at once).
+			if !postponed {
+				logV("peers: re-check postponed while the node carries traffic")
+				postponed = true
+			}
+		} else if due && time.Since(lastTry) >= reselectMinGap {
+			postponed = false
 			lastTry = time.Now()
 			weak = 0
 			if ranked, err := n.reselect(ctx, core, cfgPath); err != nil {
@@ -574,6 +589,39 @@ func (n *Node) runPeerManager(ctx context.Context, cfgPath string, lastFull time
 			weak = 0
 		}
 	}
+}
+
+// The node's own traffic (through its netstack): while it flows, the peers
+// are not changed on purpose (dropping start-up links, re-checks), since
+// that moves the node in the tree and breaks the routes for a second or
+// two. quietFor is how long without traffic counts as quiet.
+var (
+	lastTraffic atomic.Int64 // unix nanoseconds
+	quietFor    = 15 * time.Second
+	quietPoll   = 5 * time.Second
+)
+
+func noteTraffic() { lastTraffic.Store(time.Now().UnixNano()) }
+
+// busy reports whether the node carried its own traffic lately.
+func busy() bool {
+	t := lastTraffic.Load()
+	return t != 0 && time.Since(time.Unix(0, t)) < quietFor
+}
+
+// waitQuiet waits until the node carries no traffic of its own.
+func waitQuiet(ctx context.Context, what string) error {
+	if !busy() {
+		return nil
+	}
+	logV("peers: %s postponed while the node carries traffic", what)
+	for busy() {
+		if err := sleepContext(ctx, quietPoll); err != nil {
+			return err
+		}
+	}
+	logV("peers: quiet now: %s", what)
+	return nil
 }
 
 func healthyPeers() int {
