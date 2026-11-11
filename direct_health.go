@@ -20,7 +20,8 @@ import (
 // Yggdrasil route before the link comes up (once it is up, everything to the
 // peer takes it, pings too), watches the link's QUIC statistics, and closes
 // the link when it is persistently worse: traffic goes back to the Yggdrasil
-// route at once. The link is tried again after directDegradedPause.
+// route at once. The other candidates are tried soon after, that one left
+// out (see keepDirect).
 
 const (
 	// directPings: round trips measured over Yggdrasil; the median is the
@@ -42,9 +43,6 @@ const (
 	// directRTTMargin: the two are measured differently (QUIC acks,
 	// TCP over the netstack), and a tie should keep the direct link.
 	directRTTMargin = 10 * time.Millisecond
-	// directDegradedPause: a link closed for being worse is tried again
-	// after this long (directAttempts times in a row at most).
-	directDegradedPause = 2 * time.Minute
 )
 
 // directPinger answers pings on the responder's side of the exchange: each

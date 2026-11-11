@@ -151,15 +151,19 @@ defer stop()                      // the link lasts until stop
   STUN servers. The two exchange their candidates (public and local addresses
   of the socket), keys and a token over Yggdrasil (TCP, port 7701). The
   responder sends packets to the initiator's candidates, which opens its NAT;
-  the initiator dials QUIC to all of the responder's candidates and keeps the
-  first that connects. Yggdrasil links then run over QUIC streams: the
+  the initiator dials QUIC to all of the responder's candidates and, of those
+  that connect within 300 ms of the first, keeps the one with the shortest
+  round trip (a VPN tunnel's address connects too, but through the VPN, the
+  long way round). Yggdrasil links then run over QUIC streams: the
   initiator peers with a local relay pinned to the peer's key, the responder
   joins streams that carry the token to a local Yggdrasil listener.
 - **Quality.** Routing prefers a direct link whatever its quality, so the
   initiator measures the Yggdrasil route's RTT before the link comes up and
   then watches the link's QUIC statistics. A link worse than the route for 5 s
   in a row (over 5% loss, or a longer round trip) is closed: traffic goes back
-  to the Yggdrasil route at once, and the link is tried again in 2 minutes.
+  to the Yggdrasil route at once, and 10 s later the other candidates are
+  tried, that one left out. After three such links, or once every candidate
+  was found worse, the session stays on its Yggdrasil route.
 - **Privacy.** Off by default: a direct link shows each side the other's
   public IP address, which Yggdrasil otherwise hides, and asks public STUN
   servers for one's own.

@@ -41,15 +41,18 @@ import (
 //  2. The peer does the same with a socket of its own, answers with its
 //     candidates, listens for QUIC on that socket and sends small packets to
 //     every initiator candidate, which opens its NAT towards them.
-//  3. The initiator dials QUIC to every peer candidate; the first that
-//     connects wins.
+//  3. The initiator dials QUIC to every peer candidate. Of those that
+//     connect within directPickWait of the first, the one with the shortest
+//     round trip wins: a candidate can be a VPN tunnel's address, which
+//     connects but goes the long way round, through the VPN.
 //  4. The QUIC connection carries Yggdrasil links. The initiator adds a peer
 //     at a local relay (tcp://127.0.0.1:port?key=<peer key>, so the core
 //     checks it reached the right node); each connection to the relay opens a
 //     QUIC stream, which starts with the token. The peer checks the token and
 //     joins the stream to a local Yggdrasil listener.
 //  5. The initiator keeps an eye on the link: one persistently worse than the
-//     Yggdrasil route (see direct_health.go) is closed, and tried again later.
+//     Yggdrasil route (see direct_health.go) is closed; the next attempt,
+//     soon after, leaves that candidate out.
 //
 // It is off by default (SetDirect): a direct link shows each side the other's
 // public IP address, which Yggdrasil otherwise hides, and asks STUN servers
@@ -75,9 +78,16 @@ const (
 	directControlWait = 15 * time.Second
 	// directRetry: an attempt that failed is repeated after this pause, at
 	// most directAttempts times in all; a link that was up and broke is
-	// tried again at once.
-	directRetry    = 30 * time.Second
-	directAttempts = 3
+	// tried again at once. A link that was worse than the route is left
+	// out next time, and the next attempt comes after directDegradedRetry;
+	// once every candidate was found worse, the attempts stop.
+	directRetry         = 30 * time.Second
+	directDegradedRetry = 10 * time.Second
+	directAttempts      = 3
+	// directPickWait: after the first candidate connects, how long the
+	// others get to connect too, so the one with the shortest round trip
+	// can be picked.
+	directPickWait = 300 * time.Millisecond
 	// directKeepAlive keeps the NAT mappings open; directIdle declares the
 	// link dead without traffic.
 	directKeepAlive = 5 * time.Second
@@ -399,8 +409,8 @@ func (n *Node) StartDirect(peerIPv6 string) (stop func()) {
 
 // keepDirect makes direct links to ip until ctx ends: again after a link
 // broke, after directRetry when an attempt failed and after
-// directDegradedPause when the link was worse than the Yggdrasil route, up to
-// directAttempts failures in a row.
+// directDegradedRetry when the link was worse than the Yggdrasil route (that
+// candidate left out from then on), up to directAttempts failures in a row.
 func (n *Node) keepDirect(ctx context.Context, ip net.IP) {
 	peer := ip.String()
 	wait := func(d time.Duration) bool {
@@ -411,22 +421,24 @@ func (n *Node) keepDirect(ctx context.Context, ip net.IP) {
 			return true
 		}
 	}
+	avoid := map[netip.AddrPort]bool{} // candidates found worse than the route
 	for failures := 0; failures < directAttempts && ctx.Err() == nil; {
-		up, err := n.directOnce(ctx, ip)
+		up, via, err := n.directOnce(ctx, ip, avoid)
 		switch {
 		case ctx.Err() != nil:
 			return
-		case errors.Is(err, errDirectNotNeeded), errors.Is(err, errDirectOff):
+		case errors.Is(err, errDirectNotNeeded), errors.Is(err, errDirectOff), errors.Is(err, errDirectAllWorse):
 			directLogf("%s: %v", peer, err)
 			return
 		case errors.Is(err, errDirectDegraded):
 			failures++
+			avoid[via] = true
 			if failures >= directAttempts {
 				directLogf("%s: %v; staying on the Yggdrasil route", peer, err)
 				return
 			}
-			directLogf("%s: %v; back on the Yggdrasil route, trying again in %s", peer, err, directDegradedPause)
-			if !wait(directDegradedPause) {
+			directLogf("%s: %v; back on the Yggdrasil route, trying the other candidates in %s", peer, err, directDegradedRetry)
+			if !wait(directDegradedRetry) {
 				return
 			}
 			continue
@@ -447,22 +459,24 @@ var (
 	errDirectNotNeeded = errors.New("already a direct peer, nothing to do")
 	errDirectOff       = errors.New("the peer has direct links off")
 	errDirectDegraded  = errors.New("the direct link is worse than the Yggdrasil route")
+	errDirectAllWorse  = errors.New("every candidate made a link worse than the Yggdrasil route; staying on it")
 )
 
 // directOnce makes one direct link and holds it until it breaks or ctx ends.
-// up reports whether the link came up.
-func (n *Node) directOnce(ctx context.Context, ip net.IP) (up bool, err error) {
+// up reports whether the link came up, via the candidate it went to. The
+// candidates in avoid are left out.
+func (n *Node) directOnce(ctx context.Context, ip net.IP, avoid map[netip.AddrPort]bool) (up bool, via netip.AddrPort, err error) {
 	core := n.core()
 	if core == nil {
-		return false, net.ErrClosed
+		return false, via, net.ErrClosed
 	}
 	peer := ip.String()
 	if hasUpPeerAt(core, ip) {
-		return false, errDirectNotNeeded
+		return false, via, errDirectNotNeeded
 	}
 	sock, cands, err := openDirectSocket()
 	if err != nil {
-		return false, err
+		return false, via, err
 	}
 	tr := &quic.Transport{Conn: sock}
 	defer tr.Close()
@@ -473,9 +487,9 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP) (up bool, err error) {
 	c, err := n.dialDirectService(ctx, peer)
 	if err != nil {
 		if !isTimeout(err) && !errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			return false, fmt.Errorf("%w (%v)", errDirectOff, err)
+			return false, via, fmt.Errorf("%w (%v)", errDirectOff, err)
 		}
-		return false, fmt.Errorf("direct service: %w", err)
+		return false, via, fmt.Errorf("direct service: %w", err)
 	}
 	_ = c.SetDeadline(time.Now().Add(directControlWait))
 	r := bufio.NewReaderSize(c, directHelloMax)
@@ -486,7 +500,7 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP) (up bool, err error) {
 	}
 	if err != nil {
 		_ = c.Close()
-		return false, fmt.Errorf("direct service: %w", err)
+		return false, via, fmt.Errorf("direct service: %w", err)
 	}
 	// The Yggdrasil route's RTT, the yardstick for the direct link, is
 	// measured while the QUIC dials run: once the link is up, pings would
@@ -497,32 +511,36 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP) (up bool, err error) {
 		_ = c.Close()
 	}()
 	if reply.Err != "" {
-		return false, fmt.Errorf("refused: %s", reply.Err)
+		return false, via, fmt.Errorf("refused: %s", reply.Err)
 	}
 	key, err := checkDirectKey(reply.Key, ip)
 	if err != nil {
-		return false, err
+		return false, via, err
 	}
 	peerCands := parseCandidates(reply.Cands)
 	if len(peerCands) == 0 {
-		return false, fmt.Errorf("no candidates")
+		return false, via, fmt.Errorf("no candidates")
 	}
 	directLogf("%s: ours %v, theirs %v", peer, cands, reply.Cands)
+	if peerCands = leaveOut(peerCands, avoid); len(peerCands) == 0 {
+		return false, via, errDirectAllWorse
+	}
 
-	// QUIC to every candidate; the first through wins.
-	qc, err := dialFirst(ctx, tr, peerCands)
+	// QUIC to every candidate; of those through, the shortest round trip wins.
+	qc, err := dialBest(ctx, tr, peerCands)
 	if err != nil {
-		return false, err
+		return false, via, err
 	}
 	defer qc.CloseWithError(0, "done") // nolint:errcheck
-	directLogf("%s: QUIC up to %s", peer, qc.RemoteAddr())
+	via = qc.RemoteAddr().(*net.UDPAddr).AddrPort()
+	directLogf("%s: QUIC up to %s (RTT %s)", peer, via, qc.ConnectionStats().SmoothedRTT.Round(time.Millisecond))
 
 	health := directHealth{routeRTT: <-routeRTT}
 
 	// The relay the core peers through.
 	relay, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return false, err
+		return false, via, err
 	}
 	defer relay.Close()
 	go func() {
@@ -549,7 +567,7 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP) (up bool, err error) {
 	directLinks.Store(uri, struct{}{})
 	defer directLinks.Delete(uri)
 	if err := core.AddPeer(u, ""); err != nil {
-		return false, err
+		return false, via, err
 	}
 	defer core.RemovePeer(u, "") // nolint:errcheck
 	core.RetryPeersNow()
@@ -564,23 +582,23 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP) (up bool, err error) {
 		return false
 	})
 	if !linkUp {
-		return false, fmt.Errorf("yggdrasil handshake over the direct link timed out")
+		return false, via, fmt.Errorf("yggdrasil handshake over the direct link timed out")
 	}
 	tick := time.NewTicker(directCheckEvery)
 	defer tick.Stop()
 	for checks := 1; ; checks++ {
 		select {
 		case <-ctx.Done():
-			return true, ctx.Err()
+			return true, via, ctx.Err()
 		case <-qc.Context().Done():
-			return true, context.Cause(qc.Context())
+			return true, via, context.Cause(qc.Context())
 		case <-tick.C:
 		}
 		st := qc.ConnectionStats()
 		worse, why := health.check(st)
 		if worse {
 			_ = qc.CloseWithError(0, "degraded")
-			return true, fmt.Errorf("%w: %s", errDirectDegraded, why)
+			return true, via, fmt.Errorf("%w: %s", errDirectDegraded, why)
 		}
 		if checks%30 == 0 {
 			directLogf("%s: link RTT %s, %d of %d packets lost so far", peer,
@@ -608,9 +626,12 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-// dialFirst dials QUIC to all candidates at once and returns the first
-// connection; the others are cancelled.
-func dialFirst(ctx context.Context, tr *quic.Transport, cands []netip.AddrPort) (*quic.Conn, error) {
+// dialBest dials QUIC to all candidates at once. Of the connections that
+// come up within directPickWait of the first, it returns the one with the
+// shortest round trip (QUIC measures it in the handshake); the others are
+// closed and the dials still going are cancelled. A candidate may be a VPN
+// tunnel's address: it connects, but through the VPN, the long way round.
+func dialBest(ctx context.Context, tr *quic.Transport, cands []netip.AddrPort) (*quic.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, directPunchFor)
 	defer cancel()
 	type result struct {
@@ -624,24 +645,63 @@ func dialFirst(ctx context.Context, tr *quic.Transport, cands []netip.AddrPort) 
 			results <- result{qc, err}
 		}(net.UDPAddrFromAddrPort(c))
 	}
-	var win *quic.Conn
+	var up []*quic.Conn
 	var lastErr error
-	for range cands {
-		r := <-results
-		switch {
-		case r.err != nil:
-			lastErr = r.err
-		case win == nil:
-			win = r.qc
-			cancel() // the other dials stop
-		default:
-			_ = r.qc.CloseWithError(0, "another path won")
+	var grace <-chan time.Time // runs from the first connection
+	for left := len(cands); left > 0; {
+		select {
+		case r := <-results:
+			left--
+			if r.err != nil {
+				lastErr = r.err
+				continue
+			}
+			up = append(up, r.qc)
+			if grace == nil {
+				grace = time.After(directPickWait)
+			}
+		case <-grace:
+			left = 0
 		}
 	}
-	if win == nil {
+	if len(up) == 0 {
 		return nil, fmt.Errorf("no candidate reachable through the NATs (%v)", lastErr)
 	}
-	return win, nil
+	cancel() // the dials still going stop
+	rtts := make([]time.Duration, len(up))
+	for i, qc := range up {
+		rtts[i] = qc.ConnectionStats().SmoothedRTT
+	}
+	best := bestByRTT(rtts)
+	for i, qc := range up {
+		if i != best {
+			_ = qc.CloseWithError(0, "another path won")
+		}
+	}
+	return up[best], nil
+}
+
+// bestByRTT is the index of the shortest round trip; one not measured (0)
+// counts as the longest, and the first of equals wins.
+func bestByRTT(rtts []time.Duration) int {
+	best := 0
+	for i, rtt := range rtts {
+		if rtt > 0 && (rtts[best] <= 0 || rtt < rtts[best]) {
+			best = i
+		}
+	}
+	return best
+}
+
+// leaveOut returns the candidates not in avoid.
+func leaveOut(cands []netip.AddrPort, avoid map[netip.AddrPort]bool) []netip.AddrPort {
+	var out []netip.AddrPort
+	for _, c := range cands {
+		if !avoid[c] {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // punch sends small packets to every candidate until ctx ends: each opens

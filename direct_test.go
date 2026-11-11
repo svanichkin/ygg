@@ -270,7 +270,7 @@ func TestDirectStopsWhenThePeerHasItOff(t *testing.T) {
 		}
 	}()
 	_ = dialRetry(t, a, b, 9000).Close()
-	up, err := a.directOnce(context.Background(), b.Core.Address())
+	up, _, err := a.directOnce(context.Background(), b.Core.Address(), nil)
 	if up || !errors.Is(err, errDirectOff) {
 		t.Fatalf("directOnce = %v, %v; want errDirectOff", up, err)
 	}
@@ -348,5 +348,27 @@ func TestDirectHealth(t *testing.T) {
 	ticks = append(ticks, repeat(20, good)...)
 	if at, why := run(40*time.Millisecond, ticks); at != 0 {
 		t.Fatalf("a short bad spell closed the link at check %d: %s", at, why)
+	}
+}
+
+// Of the candidates that connect, the shortest round trip wins (a VPN
+// tunnel's address connects too, the long way round); a candidate that made
+// a worse link is left out next time.
+func TestDirectPicksTheShortestRoundTrip(t *testing.T) {
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	if got := bestByRTT([]time.Duration{ms(376), ms(2), ms(40)}); got != 1 {
+		t.Fatalf("bestByRTT = %d, want 1 (2 ms)", got)
+	}
+	if got := bestByRTT([]time.Duration{0, ms(50)}); got != 1 {
+		t.Fatalf("bestByRTT = %d, want 1 (an unmeasured one counts as the longest)", got)
+	}
+	if got := bestByRTT([]time.Duration{0, 0}); got != 0 {
+		t.Fatalf("bestByRTT = %d, want 0 (the first of equals)", got)
+	}
+	vpn := netip.MustParseAddrPort("10.230.4.27:58593")
+	lan := netip.MustParseAddrPort("[fd36::1]:58593")
+	left := leaveOut([]netip.AddrPort{vpn, lan}, map[netip.AddrPort]bool{vpn: true})
+	if len(left) != 1 || left[0] != lan {
+		t.Fatalf("leaveOut = %v, want [%v]", left, lan)
 	}
 }
