@@ -5,7 +5,7 @@ go 1.27.3
 require (
 	github.com/quic-go/quic-go v0.65.0
 	github.com/yggdrasil-network/yggdrasil-go v0.5.15
-	gvisor.dev/gvisor v0.0.0-20261103192924-1ff810cb4f8e
+	gvisor.dev/gvisor v0.0.0-20261113203249-327fe3affaa8
 )
 
 require (
@@ -20,10 +20,10 @@ require (
 	github.com/hjson/hjson-go/v4 v4.7.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	go.uber.org/mock v0.6.0 // indirect
-	golang.org/x/crypto v0.58.0 // indirect
-	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
+	golang.org/x/crypto v0.59.0 // indirect
+	golang.org/x/exp v0.0.0-20261113113407-e3970619a1a4 // indirect
 	golang.org/x/net v0.62.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/time v0.16.0 // indirect
 )
