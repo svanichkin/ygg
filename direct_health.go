@@ -2,10 +2,12 @@ package ygg
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -22,6 +24,13 @@ import (
 // the link when it is persistently worse: traffic goes back to the Yggdrasil
 // route at once. The other candidates are tried soon after, that one left
 // out (see keepDirect).
+//
+// QUIC's own round trip is not enough: the link is one reliable stream, and
+// when the path carries less than is sent, the excess waits in the stream's
+// send buffer, above QUIC. QUIC then still sees 150 ms while what is sent
+// arrives seconds late (and is never lost, so nothing above notices). So
+// the initiator also pings through the link (linkProbe): those pings queue
+// behind the traffic as it does.
 
 const (
 	// directPings: round trips measured over Yggdrasil; the median is the
@@ -39,6 +48,9 @@ const (
 	// (50: 5%), counted once at least directMinPackets were sent in it.
 	directMaxLossPermille = 50
 	directMinPackets      = 50
+	// directProbeWait: how long the two sides of the exchange wait for a
+	// ping or its answer before giving the connection up.
+	directProbeWait = 30 * time.Second
 	// The link's RTT is bad above the route's RTT by 25% plus
 	// directRTTMargin: the two are measured differently (QUIC acks,
 	// TCP over the netstack), and a tie should keep the direct link.
@@ -46,11 +58,12 @@ const (
 )
 
 // directPinger answers pings on the responder's side of the exchange: each
-// byte read is written back, until the initiator closes the connection or the
-// deadline set on it passes.
+// byte read is written back, until the initiator closes the connection or
+// sends nothing for directProbeWait.
 func directPinger(c net.Conn, r *bufio.Reader) {
 	defer c.Close()
 	for {
+		_ = c.SetDeadline(time.Now().Add(directProbeWait))
 		b, err := r.ReadByte()
 		if err != nil {
 			return
@@ -59,6 +72,60 @@ func directPinger(c net.Conn, r *bufio.Reader) {
 			return
 		}
 	}
+}
+
+// linkProbe pings the responder once a directCheckEvery over the exchange's
+// connection, which runs over the direct link once it is up.
+type linkProbe struct {
+	mu   sync.Mutex
+	last time.Duration // the last round trip
+	out  time.Time     // when the ping now out was sent (zero: none)
+}
+
+func (p *linkProbe) run(ctx context.Context, c net.Conn, r *bufio.Reader) {
+	buf := []byte{'p'}
+	for {
+		t0 := time.Now()
+		p.mu.Lock()
+		p.out = t0
+		p.mu.Unlock()
+		_ = c.SetDeadline(t0.Add(directProbeWait))
+		_, err := c.Write(buf)
+		if err == nil {
+			_, err = io.ReadFull(r, buf)
+		}
+		p.mu.Lock()
+		p.out = time.Time{}
+		if err == nil {
+			p.last = time.Since(t0)
+		} else {
+			p.last = 0 // unknown from now on
+		}
+		p.mu.Unlock()
+		if err != nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Until(t0.Add(directCheckEvery))):
+		}
+	}
+}
+
+// latency is the round trip through the link: the last one, or for how long
+// the ping now out has gone unanswered if that is longer. 0: unknown.
+func (p *linkProbe) latency() time.Duration {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	d := p.last
+	if !p.out.IsZero() && p.last > 0 {
+		d = max(d, time.Since(p.out))
+	}
+	return d
 }
 
 // directPing measures the round trip to the responder over the exchange's
@@ -95,9 +162,9 @@ type directHealth struct {
 	bad      int // bad checks in a row
 }
 
-// check takes the link's statistics and reports whether the link should be
-// closed, and why.
-func (h *directHealth) check(st quic.ConnectionStats) (worse bool, why string) {
+// check takes the link's statistics and the round trip through it (0:
+// unknown) and reports whether the link should be closed, and why.
+func (h *directHealth) check(st quic.ConnectionStats, through time.Duration) (worse bool, why string) {
 	h.sent = append(h.sent, st.PacketsSent)
 	h.lost = append(h.lost, st.PacketsLost)
 	if len(h.sent) > directCheckWindow+1 {
@@ -111,6 +178,9 @@ func (h *directHealth) check(st quic.ConnectionStats) (worse bool, why string) {
 		why = fmt.Sprintf("%.1f%% loss", float64(lost)*100/float64(sent))
 	case st.SmoothedRTT > limit:
 		why = fmt.Sprintf("RTT %s, the Yggdrasil route had %s", st.SmoothedRTT.Round(time.Millisecond), h.routeRTT.Round(time.Millisecond))
+	case through > limit:
+		why = fmt.Sprintf("RTT %s through its queue (QUIC sees %s), the Yggdrasil route had %s", through.Round(time.Millisecond),
+			st.SmoothedRTT.Round(time.Millisecond), h.routeRTT.Round(time.Millisecond))
 	default:
 		h.bad = 0
 		return false, ""

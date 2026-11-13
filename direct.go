@@ -94,6 +94,8 @@ const (
 	directIdle      = 20 * time.Second
 	// directMaxCandidates bounds the candidate list taken from a peer.
 	directMaxCandidates = 16
+	// directVersion is the exchange's version (see directHello).
+	directVersion = 2
 )
 
 // directLinkWait bounds the Yggdrasil handshake over a new QUIC link (a
@@ -138,7 +140,8 @@ func directLogf(format string, a ...any) {
 }
 
 // directHello is what the two sides exchange over Yggdrasil, one JSON line
-// each.
+// each. V is the version: from 2, the responder answers pings on the
+// exchange's connection for as long as the link lasts (see linkProbe).
 type directHello struct {
 	V     int      `json:"v"`
 	Key   string   `json:"key"`             // the sender's public key, hex
@@ -233,7 +236,7 @@ func (s *directService) serve(c net.Conn) {
 		return
 	}
 	reply := func(h directHello) {
-		h.V = 1
+		h.V = directVersion
 		h.Key = hex.EncodeToString(s.node.selfKey())
 		_ = writeDirectHello(c, h)
 	}
@@ -493,7 +496,7 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP, avoid map[netip.AddrPo
 	}
 	_ = c.SetDeadline(time.Now().Add(directControlWait))
 	r := bufio.NewReaderSize(c, directHelloMax)
-	err = writeDirectHello(c, directHello{V: 1, Key: hex.EncodeToString(n.selfKey()), Token: hex.EncodeToString(token), Cands: cands})
+	err = writeDirectHello(c, directHello{V: directVersion, Key: hex.EncodeToString(n.selfKey()), Token: hex.EncodeToString(token), Cands: cands})
 	var reply directHello
 	if err == nil {
 		err = readDirectHello(r, &reply)
@@ -503,13 +506,13 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP, avoid map[netip.AddrPo
 		return false, via, fmt.Errorf("direct service: %w", err)
 	}
 	// The Yggdrasil route's RTT, the yardstick for the direct link, is
-	// measured while the QUIC dials run: once the link is up, pings would
-	// take it too.
+	// measured while the QUIC dials run. Once the link is up, the pings on
+	// the same connection take it, behind everything queued on it: they
+	// measure the link as the traffic sees it (a responder from version 2
+	// answers them as long as the link lasts).
 	routeRTT := make(chan time.Duration, 1)
-	go func() {
-		routeRTT <- directPing(c, r)
-		_ = c.Close()
-	}()
+	go func() { routeRTT <- directPing(c, r) }()
+	defer c.Close()
 	if reply.Err != "" {
 		return false, via, fmt.Errorf("refused: %s", reply.Err)
 	}
@@ -536,6 +539,13 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP, avoid map[netip.AddrPo
 	directLogf("%s: QUIC up to %s (RTT %s)", peer, via, qc.ConnectionStats().SmoothedRTT.Round(time.Millisecond))
 
 	health := directHealth{routeRTT: <-routeRTT}
+	var probe *linkProbe
+	if reply.V >= directVersion {
+		probe = &linkProbe{}
+		probeCtx, stopProbe := context.WithCancel(ctx)
+		defer stopProbe()
+		go probe.run(probeCtx, c, r)
+	}
 
 	// The relay the core peers through.
 	relay, err := net.Listen("tcp", "127.0.0.1:0")
@@ -595,14 +605,14 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP, avoid map[netip.AddrPo
 		case <-tick.C:
 		}
 		st := qc.ConnectionStats()
-		worse, why := health.check(st)
+		worse, why := health.check(st, probe.latency())
 		if worse {
 			_ = qc.CloseWithError(0, "degraded")
 			return true, via, fmt.Errorf("%w: %s", errDirectDegraded, why)
 		}
 		if checks%30 == 0 {
-			directLogf("%s: link RTT %s, %d of %d packets lost so far", peer,
-				st.SmoothedRTT.Round(time.Millisecond), st.PacketsLost, st.PacketsSent)
+			directLogf("%s: link RTT %s (through its queue %s), %d of %d packets lost so far", peer,
+				st.SmoothedRTT.Round(time.Millisecond), probe.latency().Round(time.Millisecond), st.PacketsLost, st.PacketsSent)
 		}
 	}
 }

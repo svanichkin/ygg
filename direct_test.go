@@ -1,6 +1,7 @@
 package ygg
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -309,7 +310,7 @@ func TestDirectHealth(t *testing.T) {
 			st.PacketsSent += tk.sent
 			st.PacketsLost += tk.lost
 			st.SmoothedRTT = tk.rtt
-			if worse, w := h.check(st); worse {
+			if worse, w := h.check(st, 0); worse {
 				return i + 1, w
 			}
 		}
@@ -348,6 +349,83 @@ func TestDirectHealth(t *testing.T) {
 	ticks = append(ticks, repeat(20, good)...)
 	if at, why := run(40*time.Millisecond, ticks); at != 0 {
 		t.Fatalf("a short bad spell closed the link at check %d: %s", at, why)
+	}
+	// QUIC sees a fast, lossless link while what is sent waits seconds in
+	// its send buffer (an uplink that carries less than is sent): the round
+	// trip through the link closes it.
+	h := directHealth{routeRTT: 230 * time.Millisecond}
+	var st quic.ConnectionStats
+	for i := 1; i <= 20; i++ {
+		st.PacketsSent += 40
+		st.SmoothedRTT = 200 * time.Millisecond
+		through := 200 * time.Millisecond
+		if i > 5 {
+			through = time.Duration(i-5) * time.Second
+		}
+		if worse, why := h.check(st, through); worse {
+			if i != 5+directBadChecks {
+				t.Fatalf("a link queueing seconds was closed at check %d (%s), want %d", i, why, 5+directBadChecks)
+			}
+			break
+		} else if i == 20 {
+			t.Fatal("a link queueing seconds was kept")
+		}
+	}
+}
+
+// The probe's round trip includes the queue ahead of it: a ping out for
+// longer than the last round trip counts as that long already.
+func TestLinkProbeSeesTheQueue(t *testing.T) {
+	ini, resp := net.Pipe()
+	defer ini.Close()
+	hold := make(chan struct{})
+	go func() {
+		defer resp.Close()
+		r := bufio.NewReader(resp)
+		for {
+			b, err := r.ReadByte()
+			if err != nil {
+				return
+			}
+			<-hold // the answer waits until let through
+			if _, err := resp.Write([]byte{b}); err != nil {
+				return
+			}
+		}
+	}()
+	p := &linkProbe{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.run(ctx, ini, bufio.NewReader(ini))
+	hold <- struct{}{} // the first ping answered at once
+	deadline := time.Now().Add(2 * time.Second)
+	for p.latency() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.latency() == 0 {
+		t.Fatal("no round trip measured")
+	}
+	// The next ping goes out after directCheckEvery and is held.
+	time.Sleep(directCheckEvery + 600*time.Millisecond)
+	if got := p.latency(); got < 500*time.Millisecond {
+		t.Fatalf("a ping held 600 ms reads as %v", got)
+	}
+	close(hold)
+}
+
+// A responder that stops answering (the connection closed) leaves the
+// round trip unknown, not slow.
+func TestLinkProbeUnknownWhenClosed(t *testing.T) {
+	ini, resp := net.Pipe()
+	resp.Close()
+	p := &linkProbe{}
+	p.run(context.Background(), ini, bufio.NewReader(ini))
+	if got := p.latency(); got != 0 {
+		t.Fatalf("latency after the connection closed: %v, want 0 (unknown)", got)
+	}
+	var nilProbe *linkProbe
+	if nilProbe.latency() != 0 {
+		t.Fatal("no probe (an older responder) must read as unknown")
 	}
 }
 
