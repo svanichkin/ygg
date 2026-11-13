@@ -188,3 +188,91 @@ func (h *directHealth) check(st quic.ConnectionStats, through time.Duration) (wo
 	h.bad++
 	return h.bad >= directBadChecks, why
 }
+
+// Switching between the two pipes.
+//
+// While the link carries the traffic, everything to the peer takes it: the
+// Yggdrasil route cannot be measured then, only the link. So a link found
+// worse is not closed but set aside (parked): the core stops peering over
+// it, traffic goes back to the route at once, and the QUIC connection stays
+// up, idle but for its keepalives, which keep the NATs open and QUIC's
+// round trip current. While parked, the pings through the exchange's
+// connection take the route, behind its queue as the traffic sees it, and
+// QUIC measures the idle link. When the link has been clearly faster for
+// directBadChecks checks in a row, and it was parked for at least the hold,
+// the traffic goes back to it. Each time it has to be parked again soon
+// after, the hold doubles, so that a link and a route taking turns being
+// worse do not make the traffic swing between them.
+
+const (
+	// directHoldMin and directHoldMax bound how long a parked link waits
+	// before it may carry the traffic again; directHoldReset: a link that
+	// carried it for this long without trouble starts from directHoldMin.
+	directHoldMin   = 10 * time.Second
+	directHoldMax   = 160 * time.Second
+	directHoldReset = 2 * time.Minute
+	// directRouteSamples: the route's round trip while parked is the
+	// median of this many of the last pings.
+	directRouteSamples = 5
+)
+
+// directJudge and directBack are the decisions (variables for tests).
+var (
+	directJudge = (*directHealth).check
+	directBack  = (*directSwitch).back
+)
+
+// directSwitch decides when a parked link takes the traffic back.
+type directSwitch struct {
+	hold     time.Duration
+	parkedAt time.Time
+	backAt   time.Time       // when the link last took the traffic back
+	route    []time.Duration // the route's last round trips, while parked
+	good     int             // checks in a row the link was the faster
+}
+
+// park records that the link was set aside at now.
+func (s *directSwitch) park(now time.Time) {
+	switch {
+	case s.hold == 0 || (!s.backAt.IsZero() && now.Sub(s.backAt) >= directHoldReset):
+		s.hold = directHoldMin
+	default:
+		s.hold = min(2*s.hold, directHoldMax)
+	}
+	s.parkedAt, s.route, s.good = now, s.route[:0], 0
+}
+
+// routeRTT is the route's round trip measured while parked (0: none yet).
+func (s *directSwitch) routeRTT() time.Duration {
+	if len(s.route) == 0 {
+		return 0
+	}
+	r := slices.Clone(s.route)
+	slices.Sort(r)
+	return r[len(r)/2]
+}
+
+// back takes a check while parked: the idle link's round trip (QUIC) and
+// the route's (the ping through it; 0: unknown). It reports whether the
+// link should take the traffic back.
+func (s *directSwitch) back(now time.Time, link, route time.Duration) bool {
+	if route > 0 {
+		s.route = append(s.route, route)
+		if len(s.route) > directRouteSamples {
+			s.route = s.route[1:]
+		}
+	}
+	r := s.routeRTT()
+	// The same margin as for parking it (see directHealth.check), the
+	// other way round: the link must be clearly faster.
+	if r == 0 || link <= 0 || link+link/4+directRTTMargin >= r {
+		s.good = 0
+		return false
+	}
+	s.good++
+	if s.good < directBadChecks || now.Sub(s.parkedAt) < s.hold {
+		return false
+	}
+	s.backAt, s.good = now, 0
+	return true
+}

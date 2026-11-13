@@ -51,8 +51,10 @@ import (
 //     QUIC stream, which starts with the token. The peer checks the token and
 //     joins the stream to a local Yggdrasil listener.
 //  5. The initiator keeps an eye on the link: one persistently worse than the
-//     Yggdrasil route (see direct_health.go) is closed; the next attempt,
-//     soon after, leaves that candidate out.
+//     Yggdrasil route (see direct_health.go) is set aside, its traffic back
+//     on the route, and takes it again once it is clearly the faster (with
+//     an older peer, which cannot be measured that way, it is closed and the
+//     next attempt leaves that candidate out).
 //
 // It is off by default (SetDirect): a direct link shows each side the other's
 // public IP address, which Yggdrasil otherwise hides, and asks STUN servers
@@ -576,24 +578,41 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP, avoid map[netip.AddrPo
 	uri := "tcp://" + u.Host // as PeerInfo shows it: without the query
 	directLinks.Store(uri, struct{}{})
 	defer directLinks.Delete(uri)
-	if err := core.AddPeer(u, ""); err != nil {
-		return false, via, err
+	// peering: the core peers over the link (it carries the traffic) or not
+	// (parked, see directSwitch).
+	peering := false
+	setPeering := func(on bool) error {
+		if on == peering {
+			return nil
+		}
+		peering = on
+		if !on {
+			return core.RemovePeer(u, "")
+		}
+		if err := core.AddPeer(u, ""); err != nil {
+			peering = false
+			return err
+		}
+		core.RetryPeersNow()
+		return nil
 	}
-	defer core.RemovePeer(u, "") // nolint:errcheck
-	core.RetryPeersNow()
-	linkUp := waitFor(ctx, directLinkWait, func() bool {
+	defer func() { _ = setPeering(false) }()
+	linkUp := func() bool {
 		for _, p := range core.GetPeers() {
 			if p.URI == uri && isUp(p) {
-				directLogf("%s: direct link up via %s, RTT %s (the Yggdrasil route: %s)", peer, qc.RemoteAddr(),
-					p.Latency.Round(time.Millisecond), health.routeRTT.Round(time.Millisecond))
 				return true
 			}
 		}
 		return false
-	})
-	if !linkUp {
+	}
+	if err := setPeering(true); err != nil {
+		return false, via, err
+	}
+	if !waitFor(ctx, directLinkWait, linkUp) {
 		return false, via, fmt.Errorf("yggdrasil handshake over the direct link timed out")
 	}
+	directLogf("%s: direct link up via %s (the Yggdrasil route: %s)", peer, qc.RemoteAddr(), health.routeRTT.Round(time.Millisecond))
+	var sw directSwitch
 	tick := time.NewTicker(directCheckEvery)
 	defer tick.Stop()
 	for checks := 1; ; checks++ {
@@ -605,10 +624,40 @@ func (n *Node) directOnce(ctx context.Context, ip net.IP, avoid map[netip.AddrPo
 		case <-tick.C:
 		}
 		st := qc.ConnectionStats()
-		worse, why := health.check(st, probe.latency())
-		if worse {
+		now := time.Now()
+		if !peering {
+			// Parked: the pings take the route, QUIC measures the idle link.
+			if !directBack(&sw, now, st.SmoothedRTT, probe.latency()) {
+				continue
+			}
+			route := sw.routeRTT()
+			if err := setPeering(true); err != nil {
+				return true, via, err
+			}
+			if !waitFor(ctx, directLinkWait, linkUp) {
+				return true, via, fmt.Errorf("yggdrasil handshake over the parked direct link timed out")
+			}
+			health = directHealth{routeRTT: route}
+			directLogf("%s: traffic back on the direct link: RTT %s, the Yggdrasil route %s", peer,
+				st.SmoothedRTT.Round(time.Millisecond), route.Round(time.Millisecond))
+			continue
+		}
+		worse, why := directJudge(&health, st, probe.latency())
+		if worse && probe == nil {
+			// An older responder: the route cannot be measured while
+			// parked (it stops answering pings), so the link is closed
+			// and the next attempt leaves this candidate out.
 			_ = qc.CloseWithError(0, "degraded")
 			return true, via, fmt.Errorf("%w: %s", errDirectDegraded, why)
+		}
+		if worse {
+			if err := setPeering(false); err != nil {
+				return true, via, err
+			}
+			sw.park(now)
+			directLogf("%s: the direct link is worse than the Yggdrasil route (%s): traffic back on the route, the link kept aside for at least %s",
+				peer, why, sw.hold)
+			continue
 		}
 		if checks%30 == 0 {
 			directLogf("%s: link RTT %s (through its queue %s), %d of %d packets lost so far", peer,
@@ -628,7 +677,7 @@ func (n *Node) dialDirectService(ctx context.Context, peer string) (net.Conn, er
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	return ns.dialRetrying(peer, directPort, directControlWait)
+	return ns.dialRetrying(peer, directPort, directControlWait, func() { n.RefreshRoute(peer) })
 }
 
 func isTimeout(err error) bool {

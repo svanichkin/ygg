@@ -930,7 +930,7 @@ func (n *Node) DialTCP(peerIPv6 string, port int) (net.Conn, error) {
 	if ns == nil {
 		return nil, fmt.Errorf("netstack not started")
 	}
-	return ns.dialRetrying(peerIPv6, port, dialTimeout)
+	return ns.dialRetrying(peerIPv6, port, dialTimeout, func() { n.RefreshRoute(peerIPv6) })
 }
 
 const (
@@ -943,8 +943,9 @@ const (
 // node is being looked up its first packets are lost, and TCP resends a SYN
 // after ever longer pauses (1, 2, 4 s): a fresh connection gets through as
 // soon as the route is known, a waiting one only at its next resend. A dial
-// that is refused returns at once.
-func (ns *Netstack) dialRetrying(peerIPv6 string, port int, timeout time.Duration) (net.Conn, error) {
+// that is refused returns at once. After an attempt that went unanswered,
+// retry (if set) runs: a fresh path is asked for (see route.go).
+func (ns *Netstack) dialRetrying(peerIPv6 string, port int, timeout time.Duration, retry func()) (net.Conn, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		attempt := min(dialAttempt, time.Until(deadline))
@@ -954,6 +955,9 @@ func (ns *Netstack) dialRetrying(peerIPv6 string, port int, timeout time.Duratio
 		}
 		if !errors.Is(err, context.DeadlineExceeded) && !isTimeout(err) {
 			return nil, err
+		}
+		if retry != nil {
+			retry()
 		}
 	}
 }
@@ -1253,6 +1257,13 @@ func (n *Node) startConnectivityMonitor(interval time.Duration) bool {
 				cur := hasUp(core)
 				if cur != prev {
 					prev = cur
+					if cur {
+						// Our place in the tree changed, and with it the
+						// paths we had: fresh ones are asked for at once.
+						if k := n.refreshAllRoutes(); k > 0 {
+							logV("routes: back on the network, fresh paths asked for to %d nodes", k)
+						}
+					}
 					notifyConnectivity(cur)
 				}
 			}

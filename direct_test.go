@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -448,5 +449,157 @@ func TestDirectPicksTheShortestRoundTrip(t *testing.T) {
 	left := leaveOut([]netip.AddrPort{vpn, lan}, map[netip.AddrPort]bool{vpn: true})
 	if len(left) != 1 || left[0] != lan {
 		t.Fatalf("leaveOut = %v, want [%v]", left, lan)
+	}
+}
+
+// A link found worse is set aside, its traffic on the Yggdrasil route, and
+// takes the traffic again when it is the faster: the QUIC connection
+// carries a new Yggdrasil link.
+func TestDirectLinkParksAndComesBack(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts three nodes")
+	}
+	hasLocal := false
+	for _, a := range localAddrs() {
+		if !a.IsLoopback() && !a.IsLinkLocalUnicast() && !in0200(net.IP(a.AsSlice())) {
+			hasLocal = true
+		}
+	}
+	if !hasLocal {
+		t.Skip("no non-loopback address to punch through")
+	}
+	SetDirect(true)
+	defer SetDirect(false)
+	var worse, faster atomic.Bool
+	judge, back := directJudge, directBack
+	defer func() { directJudge, directBack = judge, back }()
+	directJudge = func(h *directHealth, st quic.ConnectionStats, through time.Duration) (bool, string) {
+		if worse.Load() {
+			return true, "made worse by the test"
+		}
+		return judge(h, st, through)
+	}
+	directBack = func(s *directSwitch, now time.Time, link, route time.Duration) bool {
+		back(s, now, link, route) // it measures the route
+		return faster.Load()
+	}
+
+	a, b := directChain(t)
+	bIP := b.Core.Address()
+	ln, err := b.ListenTCP(9001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(c, c); _ = c.Close() }()
+		}
+	}()
+	echo := func(what string) {
+		t.Helper()
+		c, err := a.Net.DialTCP(bIP.String(), 9001, 5*time.Second)
+		if err != nil {
+			t.Fatalf("%s: dial: %v", what, err)
+		}
+		defer c.Close()
+		msg := []byte(what)
+		_, _ = c.Write(msg)
+		got := make([]byte, len(msg))
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(c, got); err != nil || string(got) != what {
+			t.Fatalf("%s: echo %q, %v", what, got, err)
+		}
+	}
+	_ = dialRetry(t, a, b, 9001).Close()
+
+	stop := a.StartDirect(bIP.String())
+	defer stop()
+	direct := func() bool {
+		for _, p := range a.Core.GetPeers() {
+			if isUp(p) && isDirectLink(p.URI) && net.IP(address.AddrForKey(p.Key)[:]).Equal(bIP) {
+				return true
+			}
+		}
+		return false
+	}
+	if !waitFor(context.Background(), 20*time.Second, direct) {
+		t.Fatalf("no direct link: peers %+v", a.Core.GetPeers())
+	}
+	echo("over the direct link")
+
+	worse.Store(true)
+	if !waitFor(context.Background(), 10*time.Second, func() bool { return !direct() }) {
+		t.Fatal("the worse link still carries the traffic")
+	}
+	worse.Store(false)
+	echo("over the Yggdrasil route while the link is parked")
+
+	faster.Store(true)
+	if !waitFor(context.Background(), 20*time.Second, direct) {
+		t.Fatal("the parked link did not take the traffic back")
+	}
+	echo("over the direct link again")
+}
+
+// The switch: the route is measured while parked, the link must be clearly
+// faster for directBadChecks checks and the hold must have passed; a link
+// parked again soon after waits twice as long, one that did well for
+// directHoldReset starts afresh.
+func TestDirectSwitch(t *testing.T) {
+	ms := func(n int) time.Duration { return time.Duration(n) * time.Millisecond }
+	t0 := time.Unix(1000, 0)
+	var s directSwitch
+	s.park(t0)
+	if s.hold != directHoldMin {
+		t.Fatalf("first hold %v, want %v", s.hold, directHoldMin)
+	}
+	at := func(sec int) time.Time { return t0.Add(time.Duration(sec) * time.Second) }
+	// Within the hold: not back, however fast the link.
+	for i := 1; i < int(directHoldMin/time.Second); i++ {
+		if s.back(at(i), ms(100), ms(400)) {
+			t.Fatalf("back at %d s, within the hold", i)
+		}
+	}
+	if !s.back(at(int(directHoldMin/time.Second)), ms(100), ms(400)) {
+		t.Fatal("a clearly faster link was not taken back after the hold")
+	}
+	// Parked again 30 s later: the hold doubles.
+	s.park(at(40))
+	if s.hold != 2*directHoldMin {
+		t.Fatalf("hold after a quick relapse %v, want %v", s.hold, 2*directHoldMin)
+	}
+	// Not clearly faster (within the margin): stays parked.
+	for i := 41; i < 120; i++ {
+		if s.back(at(i), ms(300), ms(360)) {
+			t.Fatalf("back at %d s with the link barely faster", i)
+		}
+	}
+	// A route that does not answer (0) is no reason to come back.
+	var u directSwitch
+	u.park(t0)
+	for i := 1; i < 60; i++ {
+		if u.back(at(i), ms(50), 0) {
+			t.Fatal("back with the route unknown")
+		}
+	}
+	// Doubling stops at directHoldMax; a long good spell resets it.
+	var m directSwitch
+	m.park(t0)
+	for i := 0; i < 10; i++ {
+		m.backAt = at(i * 10)
+		m.park(at(i*10 + 1))
+	}
+	if m.hold != directHoldMax {
+		t.Fatalf("hold %v, want the cap %v", m.hold, directHoldMax)
+	}
+	m.backAt = at(1000)
+	m.park(at(1000).Add(directHoldReset))
+	if m.hold != directHoldMin {
+		t.Fatalf("hold after a long good spell %v, want %v", m.hold, directHoldMin)
 	}
 }
